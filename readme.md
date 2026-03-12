@@ -12,12 +12,19 @@
 
 ### 1. 在远程设备上安装截图服务端
 
+**Windows 用户（推荐）：**
+
+下载并双击运行启动脚本：
+https://github.com/lumia1998/koishi-plugin-screenluna/raw/main/start-server.bat
+
+脚本会自动检测 Python 环境、安装依赖并启动服务。
+
+**手动安装：**
+
 下载服务端脚本：
 ```bash
 wget https://raw.githubusercontent.com/lumia1998/koishi-plugin-screenluna/main/screenshot-server.py
 ```
-
-或直接访问下载：https://github.com/lumia1998/koishi-plugin-screenluna/blob/main/screenshot-server.py
 
 安装依赖并运行：
 ```bash
@@ -40,6 +47,6 @@ python screenshot-server.py
 
 ## 注意事项
 
-- 远程设备需要运行 screenshot-server.py
+- 远程设备需要运行截图服务
 - 确保网络可达
 - 注意防火墙设置

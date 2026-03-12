@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-screenluna",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "远程屏幕截图插件",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
@@ -9,6 +9,14 @@
   ],
   "scripts": {
     "build": "tsc"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lumia1998/koishi-plugin-screenluna.git"
+  },
+  "homepage": "https://github.com/lumia1998/koishi-plugin-screenluna#readme",
+  "bugs": {
+    "url": "https://github.com/lumia1998/koishi-plugin-screenluna/issues"
   },
   "keywords": [
     "chatbot",
