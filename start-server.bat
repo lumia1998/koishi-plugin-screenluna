@@ -13,10 +13,11 @@ if errorlevel 1 (
 )
 
 echo 检查依赖...
-python -c "import websockets, pyautogui, PIL, psutil, pystray, win32gui" >nul 2>&1
+python -c "import websockets, pyautogui, PIL, psutil, pystray, win32gui, aiohttp" >nul 2>&1
 if errorlevel 1 (
     echo 安装依赖中...
-    pip install websockets pyautogui pillow psutil GPUtil pywin32 pystray uiautomation
+    pip install aiohttp websockets pyautogui pillow psutil GPUtil pywin32 pystray
 )
 
-pythonw screenshot-server.py
+start "" pythonw screenshot-server.py
+exit

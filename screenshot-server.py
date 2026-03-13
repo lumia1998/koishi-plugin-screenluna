@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ScreenLuna Agent - Windows 系统托盘后台服务
+MonitorLuna Agent - Windows 系统托盘后台服务
 WebUI 配置界面 + WebSocket 连接到 Koishi
 """
 import asyncio
@@ -28,7 +28,7 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 WEBUI_PORT = 6315
 
 DEFAULT_CONFIG = {
-    "url": "ws://127.0.0.1:5140/screenluna",
+    "url": "ws://127.0.0.1:5140/monitorluna",
     "token": "",
     "device_id": os.environ.get("COMPUTERNAME", "my-pc"),
 }
@@ -136,12 +136,14 @@ def take_window_screenshot() -> str:
 
 
 # ── WebSocket Agent ───────────────────────────────────────────────────────────
-class ScreenLunaAgent:
+class MonitorLunaAgent:
     def __init__(self):
         self.config = load_config()
         self.status = "未连接"
         self.running = True
         self._loop = None
+        self._ws = None
+        self._last_window = None
 
     def reload_config(self):
         self.config = load_config()
@@ -173,24 +175,50 @@ class ScreenLunaAgent:
         self.status = f"连接中... {url}"
         try:
             async with websockets.connect(url, open_timeout=10, ping_interval=30, ping_timeout=10) as ws:
+                self._ws = ws
                 await ws.send(json.dumps({"type": "hello", "token": cfg["token"], "device_id": cfg["device_id"]}))
                 ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
                 if ack.get("type") != "hello_ack":
                     self.status = f"握手失败: {ack.get('message', '未知错误')}"
                     return
                 self.status = f"已连接 ✓ ({cfg['device_id']})"
-                async for raw in ws:
-                    if not self.running:
-                        break
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
-                    if msg.get("type") == "command":
-                        resp = await self._handle_command(msg)
-                        await ws.send(json.dumps(resp, ensure_ascii=False))
+                self._last_window = None
+                monitor_task = asyncio.get_event_loop().create_task(self._window_monitor(ws, cfg["device_id"]))
+                try:
+                    async for raw in ws:
+                        if not self.running:
+                            break
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        if msg.get("type") == "command":
+                            resp = await self._handle_command(msg)
+                            await ws.send(json.dumps(resp, ensure_ascii=False))
+                finally:
+                    monitor_task.cancel()
+                    self._ws = None
         except Exception as e:
             self.status = f"断开: {e}"
+            self._ws = None
+
+    async def _window_monitor(self, ws, device_id: str):
+        while True:
+            try:
+                info = await asyncio.get_event_loop().run_in_executor(None, get_window_info)
+                key = (info["process"], info["title"])
+                if key != self._last_window:
+                    self._last_window = key
+                    await ws.send(json.dumps({
+                        "type": "activity",
+                        "device_id": device_id,
+                        "process": info["process"],
+                        "title": info["title"],
+                        "pid": info["pid"],
+                    }, ensure_ascii=False))
+            except Exception:
+                pass
+            await asyncio.sleep(2)
 
     async def run_forever(self):
         delay = 3
@@ -221,7 +249,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>ScreenLuna 设置</title>
+<title>MonitorLuna 设置</title>
 <style>
 body{font-family:sans-serif;max-width:600px;margin:40px auto;padding:20px;background:#f5f5f5}
 .card{background:#fff;padding:24px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1)}
@@ -238,11 +266,11 @@ button:hover{background:#1565c0}
 </head>
 <body>
 <div class="card">
-<h1>ScreenLuna 设置</h1>
+<h1>MonitorLuna 设置</h1>
 <div class="status" id="status">状态: 加载中...</div>
 <form id="form">
 <label>Koishi WebSocket URL</label>
-<input type="text" id="url" placeholder="ws://127.0.0.1:5140/screenluna" required>
+<input type="text" id="url" placeholder="ws://127.0.0.1:5140/monitorluna" required>
 <label>Token</label>
 <input type="password" id="token" placeholder="与 Koishi 配置一致" required>
 <label>Device ID</label>
@@ -319,7 +347,7 @@ async def handle_status(request):
     return web.json_response({"status": agent.status})
 
 
-def start_webui(agent: ScreenLunaAgent):
+def start_webui(agent: MonitorLunaAgent):
     app = web.Application()
     app["agent"] = agent
     app.router.add_get("/", handle_index)
@@ -341,7 +369,7 @@ def create_tray_icon() -> Image.Image:
 
 
 def main():
-    agent = ScreenLunaAgent()
+    agent = MonitorLunaAgent()
     agent.start_in_thread()
 
     # WebUI 在后台线程运行
@@ -359,12 +387,12 @@ def main():
         pystray.MenuItem("退出", on_quit),
     )
 
-    icon = pystray.Icon("screenluna", create_tray_icon(), "ScreenLuna Agent", menu)
+    icon = pystray.Icon("monitorluna", create_tray_icon(), "MonitorLuna Agent", menu)
 
     def update_tooltip():
         while agent.running:
             try:
-                icon.title = f"ScreenLuna - {agent.status}"
+                icon.title = f"MonitorLuna - {agent.status}"
             except Exception:
                 pass
             time.sleep(3)

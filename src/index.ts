@@ -5,10 +5,33 @@ import {} from '@koishijs/plugin-server'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 
-export const name = 'screenluna'
+export const name = 'monitorluna'
 export const inject = {
-  required: ['server'],
+  required: ['server', 'database'],
   optional: ['puppeteer']
+}
+
+// ── Database Tables ──
+declare module 'koishi' {
+  interface Tables {
+    monitorluna_activity: ActivityLog
+    monitorluna_screenshot: Screenshot
+  }
+}
+
+interface ActivityLog {
+  id: number
+  deviceId: string
+  process: string
+  title: string
+  timestamp: Date
+}
+
+interface Screenshot {
+  id: number
+  deviceId: string
+  url: string
+  timestamp: Date
 }
 
 // ── Storage Backend Interface ──
@@ -24,7 +47,7 @@ class LocalStorage implements StorageBackend {
   constructor(private ctx: Context, private config: Config) {}
 
   async init() {
-    const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/screenluna')
+    const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/monitorluna')
     await fs.mkdir(dir, { recursive: true })
 
     // Mount HTTP route
@@ -41,7 +64,7 @@ class LocalStorage implements StorageBackend {
   }
 
   async upload(buffer: Buffer, filename: string) {
-    const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/screenluna')
+    const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/monitorluna')
     const filepath = path.join(dir, filename)
     await fs.writeFile(filepath, buffer)
     const baseUrl = this.config.serverPath || 'http://127.0.0.1:5140'
@@ -49,12 +72,12 @@ class LocalStorage implements StorageBackend {
   }
 
   async delete(key: string) {
-    const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/screenluna')
+    const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/monitorluna')
     await fs.unlink(path.join(dir, key)).catch(() => {})
   }
 
   async cleanup(days: number) {
-    const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/screenluna')
+    const dir = path.join(this.ctx.baseDir, this.config.storagePath || 'data/monitorluna')
     const cutoff = Date.now() - days * 86400000
     const files = await fs.readdir(dir)
     for (const file of files) {
@@ -145,6 +168,7 @@ class S3Storage implements StorageBackend {
 export interface Config {
   token: string
   commandTimeout: number
+  debug: boolean
   storageType: 'local' | 'webdav' | 's3'
   storagePath?: string
   serverPath?: string
@@ -160,11 +184,6 @@ export interface Config {
   s3PublicUrl?: string
   s3PathStyle?: boolean
   imageRetentionDays: number
-  pushTargets: Array<{
-    deviceId: string
-    channelIds: string[]
-    pollInterval: number
-  }>
   dailySummaryEnabled: boolean
   dailySummaryTime: string
   dailySummaryTargets: Array<{
@@ -177,12 +196,13 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     token: Schema.string().required().description('鉴权 Token，需与 Agent 端一致'),
     commandTimeout: Schema.number().default(15000).description('指令超时时间（毫秒）'),
+    debug: Schema.boolean().default(false).description('启用调试日志'),
     storageType: Schema.union(['local', 'webdav', 's3']).default('local').description('存储后端类型'),
   }),
   Schema.union([
     Schema.object({
       storageType: Schema.const('local'),
-      storagePath: Schema.string().default('data/screenluna').description('本地存储目录'),
+      storagePath: Schema.string().default('data/monitorluna').description('本地存储目录'),
       serverPath: Schema.string().description('Koishi 公网地址（用于生成图片 URL）'),
     }),
     Schema.object({
@@ -205,11 +225,6 @@ export const Config: Schema<Config> = Schema.intersect([
   ]),
   Schema.object({
     imageRetentionDays: Schema.number().default(7).description('图片保存天数'),
-    pushTargets: Schema.array(Schema.object({
-      deviceId: Schema.string().required().description('设备 ID'),
-      channelIds: Schema.array(String).description('推送目标群组（格式: platform:botId:channelId）'),
-      pollInterval: Schema.number().default(10000).description('轮询间隔（毫秒）'),
-    })).default([]).description('实时推送配置'),
     dailySummaryEnabled: Schema.boolean().default(false).description('启用每日总结'),
     dailySummaryTime: Schema.string().default('22:00').description('每日总结时间（HH:mm）'),
     dailySummaryTargets: Schema.array(Schema.object({
@@ -230,14 +245,6 @@ interface DeviceConnection {
   }>
 }
 
-interface ActivityRecord {
-  deviceId: string
-  process: string
-  title: string
-  screenshotUrl: string
-  timestamp: Date
-}
-
 function generateId(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36)
 }
@@ -245,10 +252,23 @@ function generateId(): string {
 // ── Main Plugin ──
 export function apply(ctx: Context, config: Config) {
   const devices = new Map<string, DeviceConnection>()
-  const lastKnownApp = new Map<string, { title: string; process: string }>()
-  const activityHistory: ActivityRecord[] = []
-  const pollTimers: ReturnType<typeof setInterval>[] = []
   let storage: StorageBackend
+
+  // Initialize database
+  ctx.model.extend('monitorluna_activity', {
+    id: 'unsigned',
+    deviceId: 'string',
+    process: 'string',
+    title: 'text',
+    timestamp: 'timestamp'
+  }, { autoInc: true })
+
+  ctx.model.extend('monitorluna_screenshot', {
+    id: 'unsigned',
+    deviceId: 'string',
+    url: 'string',
+    timestamp: 'timestamp'
+  }, { autoInc: true })
 
   // Initialize storage
   if (config.storageType === 'local') storage = new LocalStorage(ctx, config)
@@ -258,16 +278,15 @@ export function apply(ctx: Context, config: Config) {
   ctx.on('ready', async () => {
     await storage.init()
     startCleanupTimer()
-    startPushPolling()
+    startPeriodicScreenshot()
     if (config.dailySummaryEnabled) startDailySummary()
   })
 
   ctx.on('dispose', () => {
-    pollTimers.forEach(t => clearInterval(t))
   })
 
   // WebSocket handler
-  ctx.server.ws('/screenluna', (ws: WebSocket, req: IncomingMessage) => {
+  ctx.server.ws('/monitorluna', (ws: WebSocket, req: IncomingMessage) => {
     let deviceId: string | null = null
     let device: DeviceConnection | null = null
 
@@ -289,8 +308,17 @@ export function apply(ctx: Context, config: Config) {
         deviceId = String(msg.device_id || 'unknown')
         device = { ws, deviceId, pendingCommands: new Map() }
         devices.set(deviceId, device)
-        ctx.logger.info(`[screenluna] 设备上线: ${deviceId}`)
+        ctx.logger.info(`[monitorluna] 设备上线: ${deviceId}`)
         ws.send(JSON.stringify({ type: 'hello_ack', message: 'connected' }))
+        return
+      }
+
+      if (msg.type === 'activity') {
+        if (!deviceId) {
+          ws.close(1008, 'not authenticated')
+          return
+        }
+        handleActivity(msg).catch(e => ctx.logger.warn(`[monitorluna] 处理活动失败: ${e.message}`))
         return
       }
 
@@ -313,7 +341,7 @@ export function apply(ctx: Context, config: Config) {
     ws.on('close', () => {
       if (deviceId) {
         devices.delete(deviceId)
-        ctx.logger.info(`[screenluna] 设备下线: ${deviceId}`)
+        ctx.logger.info(`[monitorluna] 设备下线: ${deviceId}`)
         if (device) {
           for (const pending of device.pendingCommands.values()) {
             clearTimeout(pending.timer)
@@ -325,7 +353,7 @@ export function apply(ctx: Context, config: Config) {
     })
 
     ws.on('error', (err) => {
-      ctx.logger.warn(`[screenluna] WebSocket 错误: ${err.message}`)
+      ctx.logger.warn(`[monitorluna] WebSocket 错误: ${err.message}`)
     })
   })
 
@@ -343,50 +371,50 @@ export function apply(ctx: Context, config: Config) {
     })
   }
 
-  function startCleanupTimer() {
-    setInterval(() => {
-      storage.cleanup(config.imageRetentionDays).catch(e =>
-        ctx.logger.warn(`[screenluna] 清理失败: ${e.message}`)
-      )
-    }, 86400000) // Daily
+  async function handleActivity(msg: any) {
+    const deviceId = msg.device_id
+    const process = msg.process
+    const title = msg.title
+    if (config.debug) ctx.logger.info(`[monitorluna][debug] activity: device=${deviceId}, process=${process}, title=${title}`)
+    try {
+      await ctx.database.create('monitorluna_activity', {
+        deviceId,
+        process,
+        title,
+        timestamp: new Date()
+      })
+    } catch (e) {
+      ctx.logger.warn(`[monitorluna] 记录活动失败: ${e instanceof Error ? e.message : String(e)}`)
+    }
   }
 
-  function startPushPolling() {
-    for (const target of config.pushTargets) {
-      const timer = setInterval(async () => {
+  function startPeriodicScreenshot() {
+    setInterval(async () => {
+      for (const [deviceId] of devices) {
         try {
-          const data = await sendCommand(target.deviceId, 'window_info')
-          const info = JSON.parse(data)
-          const last = lastKnownApp.get(target.deviceId)
-
-          if (!last || last.process !== info.process || last.title !== info.title) {
-            lastKnownApp.set(target.deviceId, { process: info.process, title: info.title })
-
-            const screenshot = await sendCommand(target.deviceId, 'window_screenshot')
-            const buf = Buffer.from(screenshot, 'base64')
-            const filename = `${target.deviceId}_${Date.now()}.jpg`
-            const { url } = await storage.upload(buf, filename)
-
-            activityHistory.push({
-              deviceId: target.deviceId,
-              process: info.process,
-              title: info.title,
-              screenshotUrl: url,
-              timestamp: new Date()
-            })
-
-            const msg = `应用切换: ${info.process}\n${info.title}\n` + h.image(url)
-            for (const channelId of target.channelIds) {
-              const [platform, selfId, gid] = channelId.split(':')
-              await ctx.bots[`${platform}:${selfId}`]?.sendMessage(gid, msg)
-            }
-          }
+          const data = await sendCommand(deviceId, 'screenshot')
+          const buf = Buffer.from(data, 'base64')
+          const filename = `${deviceId}_${Date.now()}.jpg`
+          const { url } = await storage.upload(buf, filename)
+          await ctx.database.create('monitorluna_screenshot', {
+            deviceId,
+            url,
+            timestamp: new Date()
+          })
+          if (config.debug) ctx.logger.info(`[monitorluna][debug] periodic screenshot ok: ${deviceId}, url: ${url}`)
         } catch (e) {
           // Device offline, skip
         }
-      }, target.pollInterval)
-      pollTimers.push(timer)
-    }
+      }
+    }, 15 * 60 * 1000) // 每 15 分钟
+  }
+
+  function startCleanupTimer() {
+    setInterval(() => {
+      storage.cleanup(config.imageRetentionDays).catch(e =>
+        ctx.logger.warn(`[monitorluna] 清理失败: ${e.message}`)
+      )
+    }, 86400000) // Daily
   }
 
   function startDailySummary() {
@@ -400,21 +428,30 @@ export function apply(ctx: Context, config: Config) {
   }
 
   async function generateDailySummary() {
-    const today = new Date().toISOString().split('T')[0]
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    const tomorrow = new Date(today)
+    tomorrow.setDate(tomorrow.getDate() + 1)
+
     for (const target of config.dailySummaryTargets) {
-      const records = activityHistory.filter(r =>
-        r.deviceId === target.deviceId &&
-        r.timestamp.toISOString().startsWith(today)
-      )
+      const records = await ctx.database.get('monitorluna_activity', {
+        deviceId: target.deviceId,
+        timestamp: { $gte: today, $lt: tomorrow }
+      })
       if (records.length === 0) continue
 
       const html = buildSummaryHtml(records, target.deviceId)
       const puppeteer = (ctx as any)['puppeteer']
       if (!puppeteer) {
-        ctx.logger.warn('[screenluna] puppeteer 服务未启用，跳过每日总结')
+        ctx.logger.warn('[monitorluna] puppeteer 服务未启用，跳过每日总结')
         continue
       }
-      const buf = await puppeteer.render(html)
+      const page = await puppeteer.page()
+      await page.setContent(html)
+      const body = await page.$('body')
+      const clip = body ? await body.boundingBox() : null
+      const buf = await page.screenshot({ clip, type: 'jpeg', quality: 90 })
+      await page.close()
       const filename = `summary_${target.deviceId}_${Date.now()}.jpg`
       const { url } = await storage.upload(buf, filename)
 
@@ -423,41 +460,133 @@ export function apply(ctx: Context, config: Config) {
         await ctx.bots[`${platform}:${selfId}`]?.sendMessage(gid, h.image(url))
       }
     }
-    activityHistory.length = 0
   }
 
-  function buildSummaryHtml(records: ActivityRecord[], deviceId: string): string {
+  function buildSummaryHtml(records: ActivityLog[], deviceId: string): string {
     const date = new Date().toLocaleDateString('zh-CN')
-    const appCount = new Map<string, number>()
-    records.forEach(r => appCount.set(r.process, (appCount.get(r.process) || 0) + 1))
-    const top3 = [...appCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
+
+    // 按时间排序
+    records.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+
+    // 按小时统计每个进程的活跃时长（分钟）
+    const hourlyStats = new Map<number, Map<string, number>>() // hour -> process -> minutes
+    for (let h = 0; h < 24; h++) hourlyStats.set(h, new Map())
+
+    for (let i = 0; i < records.length - 1; i++) {
+      const curr = records[i]
+      const next = records[i + 1]
+      const duration = (next.timestamp.getTime() - curr.timestamp.getTime()) / 1000 / 60 // 分钟
+      const hour = curr.timestamp.getHours()
+
+      const processMap = hourlyStats.get(hour)!
+      processMap.set(curr.process, (processMap.get(curr.process) || 0) + duration)
+    }
+
+    // 计算每小时的总活跃次数（用于柱状图）
+    const hourlyActivity = new Map<number, number>()
+    for (let h = 0; h < 24; h++) hourlyActivity.set(h, 0)
+    records.forEach(r => {
+      const hour = r.timestamp.getHours()
+      hourlyActivity.set(hour, (hourlyActivity.get(hour) || 0) + 1)
+    })
+
+    // 每小时活跃时间最长的 4 个进程
+    const hourlyTop4 = new Map<number, Array<[string, number]>>()
+    for (const [hour, processMap] of hourlyStats.entries()) {
+      const top4 = [...processMap.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 4)
+      hourlyTop4.set(hour, top4)
+    }
+
+    // 全天活跃时间最长的 4 个进程
+    const totalDuration = new Map<string, number>()
+    for (const processMap of hourlyStats.values()) {
+      for (const [process, duration] of processMap) {
+        totalDuration.set(process, (totalDuration.get(process) || 0) + duration)
+      }
+    }
+    const topDuration = [...totalDuration.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4)
+
+    const maxActivity = Math.max(...hourlyActivity.values(), 1)
+    const startHour = records.length > 0 ? Math.min(...records.map(r => r.timestamp.getHours())) : 0
+    const endHour = records.length > 0 ? Math.max(...records.map(r => r.timestamp.getHours())) : 23
 
     return `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><style>
-body{margin:0;padding:40px;background:linear-gradient(180deg,#fbfbf9,#efefe9);font-family:serif;width:600px}
-h1{font-size:28px;color:#333;margin:0 0 30px}
-.timeline{position:relative;padding-left:30px;border-left:1px solid #e7e5e4}
-.item{margin-bottom:20px;position:relative}
-.item::before{content:'';position:absolute;left:-34px;top:6px;width:8px;height:8px;border-radius:50%;background:#588157}
-.time{font-size:12px;color:#999}
-.app{font-size:16px;color:#588157;font-weight:600}
-.title{font-size:14px;color:#666;font-style:italic}
-.stats{margin-top:40px;padding:20px;background:#f5f5f0;border-radius:8px}
-</style></head><body>
-<h1>今日活动总结 · ${date}</h1>
-<div style="color:#999;margin-bottom:20px">设备: ${deviceId}</div>
-<div class="timeline">
-${records.map(r => `<div class="item">
-<div class="time">${r.timestamp.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</div>
-<div class="app">${r.process}</div>
-<div class="title">${r.title}</div>
+<html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&family=Patrick+Hand&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg-paper:#fdfbf7;--ink-primary:#5d4037;--ink-secondary:#8d6e63;--color-yellow:#fff9c4;--color-pink:#ffccbc;--color-blue:#b3e5fc;--color-green:#c8e6c9;--accent-orange:#ff7043;--font-title:'ZCOOL KuaiLe',cursive;--font-hand:'Patrick Hand',"KaiTi",serif;--font-body:'Noto Sans SC',sans-serif}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:var(--font-body);color:var(--ink-primary);background-color:var(--bg-paper);background-image:radial-gradient(#ddd 2px,transparent 2px);background-size:20px 20px;min-height:100vh;padding:40px 20px;line-height:1.6}
+.container{max-width:900px;margin:0 auto;background:#fff;border:2px solid var(--ink-primary);border-radius:20px;padding:40px;box-shadow:8px 8px 0 var(--color-blue),16px 16px 0 var(--color-pink),0 20px 40px rgba(0,0,0,0.1)}
+.container::before{content:"";position:absolute;top:12px;bottom:12px;left:12px;right:12px;border:2px dashed var(--ink-secondary);border-radius:15px;pointer-events:none;opacity:0.5}
+.header{text-align:center;margin-bottom:40px;position:relative;padding-top:20px}
+.title-sticker{display:inline-block;background:#fff;padding:20px 40px;border:3px dashed var(--ink-primary);border-radius:15px;box-shadow:5px 5px 0 var(--color-blue);transform:rotate(-2deg);position:relative}
+.title-sticker h1{font-family:var(--font-title);font-size:2.5rem;color:var(--accent-orange);margin:0;-webkit-text-stroke:1px var(--ink-primary)}
+.date-badge{position:absolute;bottom:-15px;right:-20px;background:var(--color-yellow);padding:5px 15px;font-family:var(--font-hand);font-size:1.1rem;box-shadow:2px 2px 3px rgba(0,0,0,0.1);transform:rotate(5deg);border:1px solid var(--ink-primary)}
+.tape{position:absolute;top:-15px;left:50%;transform:translateX(-50%);width:100px;height:20px;background:rgba(255,171,145,0.7);opacity:0.8}
+.section{margin-bottom:35px}
+.section-title{font-family:var(--font-title);font-size:1.5rem;margin-bottom:15px;color:var(--accent-orange);display:flex;align-items:center;gap:8px}
+.chart-box{background:#fff;padding:20px;border:2px solid var(--ink-primary);border-radius:12px;box-shadow:4px 4px 0 var(--color-green)}
+.chart{display:flex;align-items:flex-end;height:180px;gap:3px;padding:10px 0}
+.bar{flex:1;background:var(--accent-orange);border-radius:4px 4px 0 0;position:relative;min-height:2px}
+.bar-label{position:absolute;bottom:-22px;left:50%;transform:translateX(-50%);font-size:10px;color:var(--ink-secondary);white-space:nowrap}
+.list-box{background:#fff;padding:20px;border:2px solid var(--ink-primary);border-radius:12px;box-shadow:4px 4px 0 var(--color-pink)}
+.list-item{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px dashed #e0e0e0}
+.list-item:last-child{border-bottom:none}
+.item-name{font-weight:600;color:var(--ink-primary);flex:1}
+.item-value{color:var(--accent-orange);font-weight:600;margin-left:10px}
+.hour-section{margin-bottom:20px;padding:12px;border:1px dashed var(--ink-secondary);border-radius:8px;background:#fafafa}
+.hour-label{font-weight:700;color:var(--ink-secondary);margin-bottom:6px;font-size:0.95rem}
+.hour-list{display:flex;flex-wrap:wrap;gap:6px}
+.hour-tag{background:var(--color-blue);padding:3px 10px;border-radius:12px;font-size:0.85rem;color:var(--ink-primary)}
+.footer{text-align:center;margin-top:40px;font-family:var(--font-hand);color:var(--ink-secondary);font-size:0.9rem}
+</style>
+</head><body><div class="container">
+<div class="header">
+<div class="title-sticker">
+<div class="tape"></div>
+<h1>今日活动总结</h1>
+<div class="date-badge">${date}</div>
+</div>
+</div>
+<div style="text-align:center;color:var(--ink-secondary);margin-bottom:30px;font-family:var(--font-hand)">设备: ${deviceId} · 统计时段: ${startHour}:00 - ${endHour}:59</div>
+<div class="section">
+<div class="section-title">📊 24H 活跃轨迹</div>
+<div class="chart-box">
+<div class="chart">
+${Array.from(hourlyActivity.entries()).map(([hour, count]) => {
+  const height = count > 0 ? (count / maxActivity * 100) : 2
+  return `<div class="bar" style="height:${height}%"><div class="bar-label">${hour}</div></div>`
+}).join('')}
+</div>
+</div>
+</div>
+<div class="section">
+<div class="section-title">⏱️ 全天活跃时间 TOP 4</div>
+<div class="list-box">
+${topDuration.map(([app, duration], idx) => `<div class="list-item">
+<div class="item-name">${idx + 1}. ${app}</div>
+<div class="item-value">${Math.round(duration)} 分钟</div>
 </div>`).join('')}
 </div>
-<div class="stats">
-<div style="font-weight:600;margin-bottom:10px">最常使用</div>
-${top3.map(([app, count]) => `<div>${app}: ${count} 次</div>`).join('')}
 </div>
-</body></html>`
+<div class="section">
+<div class="section-title">🕐 每小时 TOP 4</div>
+<div class="chart-box">
+${Array.from(hourlyTop4.entries()).filter(([, top]) => top.length > 0).map(([hour, top]) => `<div class="hour-section">
+<div class="hour-label">${hour}:00 - ${hour}:59</div>
+<div class="hour-list">
+${top.map(([app, dur]) => `<span class="hour-tag">${app} ${Math.round(dur)}m</span>`).join('')}
+</div>
+</div>`).join('')}
+</div>
+</div>
+<div class="footer">Generated by MonitorLuna · Scrapbook Theme</div>
+</div></body></html>`
   }
 
   // Bot commands
@@ -517,16 +646,43 @@ ${top3.map(([app, count]) => `<div>${app}: ${count} 次</div>`).join('')}
       }
     })
 
-  monitor.subcommand('.history <device:string>', '查看当天活动历史')
+  monitor.subcommand('.analytics <device:string>', '生成当天活动总结')
     .action(async ({ session }, device) => {
       if (!device) return '请指定设备名称'
-      const today = new Date().toISOString().split('T')[0]
-      const records = activityHistory
-        .filter(r => r.deviceId === device && r.timestamp.toISOString().startsWith(today))
-        .slice(-10)
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      const tomorrow = new Date(today)
+      tomorrow.setDate(tomorrow.getDate() + 1)
+
+      const records = await ctx.database.get('monitorluna_activity', {
+        deviceId: device,
+        timestamp: { $gte: today, $lt: tomorrow }
+      })
+      if (config.debug) ctx.logger.info(`[monitorluna][debug] analytics: device=${device}, records=${records.length}`)
       if (records.length === 0) return '今日暂无活动记录'
-      return records.map(r =>
-        `${r.timestamp.toLocaleTimeString('zh-CN')} - ${r.process}: ${r.title}`
-      ).join('\n')
+
+      const puppeteer = (ctx as any)['puppeteer']
+      if (config.debug) ctx.logger.info(`[monitorluna][debug] puppeteer service: ${puppeteer ? 'available' : 'not available'}`)
+      if (!puppeteer) return '需要安装 puppeteer 插件才能生成总结图'
+
+      try {
+        const html = buildSummaryHtml(records, device)
+        if (config.debug) ctx.logger.info(`[monitorluna][debug] html length: ${html.length}`)
+
+        const page = await puppeteer.page()
+        await page.setContent(html)
+        const body = await page.$('body')
+        const clip = body ? await body.boundingBox() : null
+        const buf = await page.screenshot({ clip, type: 'jpeg', quality: 90 })
+        await page.close()
+
+        if (config.debug) ctx.logger.info(`[monitorluna][debug] screenshot ok, buf size: ${buf.length}`)
+        const filename = `summary_${device}_${Date.now()}.jpg`
+        const { url } = await storage.upload(buf, filename)
+        if (config.debug) ctx.logger.info(`[monitorluna][debug] upload ok, url: ${url}`)
+        return h.image(url)
+      } catch (e) {
+        return `生成总结失败: ${e instanceof Error ? e.message : String(e)}`
+      }
     })
 }
