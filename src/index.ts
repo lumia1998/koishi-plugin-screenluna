@@ -166,6 +166,7 @@ class WebDAVStorage implements StorageBackend {
 
   async cleanup(days: number) {
     const cutoff = new Date(Date.now() - days * 86400000)
+    if (!this.config.webdavEndpoint) return
     const auth = Buffer.from(`${this.config.webdavUsername}:${this.config.webdavPassword}`).toString('base64')
 
     try {
@@ -226,15 +227,14 @@ class S3Storage implements StorageBackend {
 
   async cleanup(days: number) {
     const cutoff = new Date(Date.now() - days * 86400000)
+    if (!this.config.s3Endpoint) return
     try {
-      // ListObjectsV2
       const listUrl = this.getUrl('') + '?list-type=2'
       const listHeaders = await this.signRequest('GET', '')
       const res = await fetch(listUrl, { method: 'GET', headers: listHeaders })
       if (!res.ok) return
 
       const xml = await res.text()
-      // Extract keys and last modified dates
       const keyRegex = /<Key>([^<]+)<\/Key>/g
       const modifiedRegex = /<LastModified>([^<]+)<\/LastModified>/g
 
@@ -251,7 +251,6 @@ class S3Storage implements StorageBackend {
 
       if (toDelete.length === 0) return
 
-      // DeleteObjects (batch)
       const deleteXml = [
         '<?xml version="1.0"?><Delete>',
         ...toDelete.map(k => `<Object><Key>${k}</Key></Object>`),
@@ -467,7 +466,7 @@ export function apply(ctx: Context, config: Config) {
           ws.close(1008, 'not authenticated')
           return
         }
-        handleActivity(msg).catch(e => ctx.logger.warn(`[monitorluna] 处理活动失败: ${e.message}`))
+        handleActivity(deviceId, msg).catch(e => ctx.logger.warn(`[monitorluna] 处理活动失败: ${e.message}`))
         return
       }
 
@@ -476,7 +475,7 @@ export function apply(ctx: Context, config: Config) {
           ws.close(1008, 'not authenticated')
           return
         }
-        handleInputStats(msg).catch(e => ctx.logger.warn(`[monitorluna] 处理输入统计失败: ${e.message}`))
+        handleInputStats(deviceId, msg).catch(e => ctx.logger.warn(`[monitorluna] 处理输入统计失败: ${e.message}`))
         return
       }
 
@@ -541,8 +540,7 @@ export function apply(ctx: Context, config: Config) {
     })
   }
 
-  async function handleActivity(msg: any) {
-    if (!deviceId) return
+  async function handleActivity(deviceId: string, msg: any) {
     const process = msg.process
     const title = msg.title
     const afk: boolean = msg.afk === true
@@ -550,7 +548,6 @@ export function apply(ctx: Context, config: Config) {
     try {
       const now = new Date()
       const cutoff = new Date(now.getTime() - 10000)
-      // Find a recent record to merge into (same device + process, endTime within 10s)
       const recent = await ctx.database.get('monitorluna_activity', {
         deviceId,
         process,
@@ -573,8 +570,7 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  async function handleInputStats(msg: any) {
-    if (!deviceId) return
+  async function handleInputStats(deviceId: string, msg: any) {
     const stats = msg.stats
     if (!stats) return
     if (config.debug) ctx.logger.info(`[monitorluna][debug] input_stats: device=${deviceId}, apps=${Object.keys(stats).length}`)
