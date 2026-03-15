@@ -485,8 +485,8 @@ export function apply(ctx: Context, config: Config) {
         scrollDistance: data.scroll_distance || 0,
         timestamp: now
       }))
-      for (const row of rows) {
-        await ctx.database.create('monitorluna_input_stats', row)
+      if (rows.length > 0) {
+        await ctx.database.upsert('monitorluna_input_stats', rows)
       }
     } catch (e) {
       ctx.logger.warn(`[monitorluna] 记录输入统计失败: ${e instanceof Error ? e.message : String(e)}`)
