@@ -48,6 +48,8 @@ interface ActivityLog {
   process: string
   title: string
   timestamp: Date
+  endTime: Date
+  afk: boolean
 }
 
 interface Screenshot {
@@ -298,7 +300,9 @@ export function apply(ctx: Context, config: Config) {
     deviceId: 'string',
     process: 'string',
     title: 'text',
-    timestamp: 'timestamp'
+    timestamp: 'timestamp',
+    endTime: 'timestamp',
+    afk: 'boolean',
   }, { autoInc: true })
 
   ctx.model.extend('monitorluna_screenshot', {
@@ -435,14 +439,29 @@ export function apply(ctx: Context, config: Config) {
     if (!deviceId) return
     const process = msg.process
     const title = msg.title
-    if (config.debug) ctx.logger.info(`[monitorluna][debug] activity: device=${deviceId}, process=${process}, title=${title}`)
+    const afk: boolean = msg.afk === true
+    if (config.debug) ctx.logger.info(`[monitorluna][debug] activity: device=${deviceId}, process=${process}, title=${title}, afk=${afk}`)
     try {
-      await ctx.database.create('monitorluna_activity', {
+      const now = new Date()
+      const cutoff = new Date(now.getTime() - 10000)
+      // Find a recent record to merge into (same device + process, endTime within 10s)
+      const recent = await ctx.database.get('monitorluna_activity', {
         deviceId,
         process,
-        title,
-        timestamp: new Date()
-      })
+        endTime: { $gte: cutoff }
+      }, { limit: 1, sort: { endTime: 'desc' } })
+      if (recent.length > 0) {
+        await ctx.database.set('monitorluna_activity', recent[0].id, { endTime: now, afk })
+      } else {
+        await ctx.database.create('monitorluna_activity', {
+          deviceId,
+          process,
+          title,
+          timestamp: now,
+          endTime: now,
+          afk,
+        })
+      }
     } catch (e) {
       ctx.logger.warn(`[monitorluna] 记录活动失败: ${e instanceof Error ? e.message : String(e)}`)
     }
@@ -594,30 +613,42 @@ export function apply(ctx: Context, config: Config) {
     const maxClicks = Math.max(...topInputApps.map(([, s]) => s.clicks), 1)
     const maxScroll = Math.max(...topInputApps.map(([, s]) => s.scrollDistance), 1)
 
+    // 过滤 AFK 记录，计算实际活跃时间
+    const activeRecords = records.filter(r => !r.afk)
+    const totalActiveMs = records.reduce((sum, r) => {
+      if (r.afk) return sum
+      const end = r.endTime ? r.endTime.getTime() : r.timestamp.getTime()
+      return sum + Math.max(0, end - r.timestamp.getTime())
+    }, 0)
+    const totalActiveMinutes = Math.round(totalActiveMs / 1000 / 60)
+
     // 按时间排序
     records.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
 
-    // 按小时统计每个进程的活跃时长（分钟）
+    // 按小时统计每个进程的活跃时长（分钟），使用 endTime - timestamp
     const hourlyStats = new Map<number, Map<string, number>>() // hour -> process -> minutes
     for (let h = 0; h < 24; h++) hourlyStats.set(h, new Map())
 
-    for (let i = 0; i < records.length - 1; i++) {
-      const curr = records[i]
-      const next = records[i + 1]
-      const duration = (next.timestamp.getTime() - curr.timestamp.getTime()) / 1000 / 60 // 分钟
-      const hour = curr.timestamp.getHours()
-
+    for (const record of records) {
+      if (record.afk) continue
+      const end = record.endTime ? record.endTime.getTime() : record.timestamp.getTime()
+      const duration = Math.max(0, end - record.timestamp.getTime()) / 1000 / 60 // 分钟
+      if (duration <= 0) continue
+      const hour = record.timestamp.getHours()
       const processMap = hourlyStats.get(hour)!
-      processMap.set(curr.process, (processMap.get(curr.process) || 0) + duration)
+      processMap.set(record.process, (processMap.get(record.process) || 0) + duration)
     }
 
-    // 计算每小时的总活跃次数（用于柱状图）
+    // 计算每小时的总活跃时长（分钟，用于柱状图）
     const hourlyActivity = new Map<number, number>()
     for (let h = 0; h < 24; h++) hourlyActivity.set(h, 0)
-    records.forEach(r => {
-      const hour = r.timestamp.getHours()
-      hourlyActivity.set(hour, (hourlyActivity.get(hour) || 0) + 1)
-    })
+    for (const record of records) {
+      if (record.afk) continue
+      const end = record.endTime ? record.endTime.getTime() : record.timestamp.getTime()
+      const duration = Math.max(0, end - record.timestamp.getTime()) / 1000 / 60
+      const hour = record.timestamp.getHours()
+      hourlyActivity.set(hour, (hourlyActivity.get(hour) || 0) + duration)
+    }
 
     // 每小时活跃时间最长的 4 个进程
     const hourlyTop4 = new Map<number, Array<[string, number]>>()
@@ -642,6 +673,11 @@ export function apply(ctx: Context, config: Config) {
     const maxActivity = Math.max(...hourlyActivity.values(), 1)
     const startHour = records.length > 0 ? Math.min(...records.map(r => r.timestamp.getHours())) : 0
     const endHour = records.length > 0 ? Math.max(...records.map(r => r.timestamp.getHours())) : 23
+    const afkMinutes = Math.round(records.reduce((sum, r) => {
+      if (!r.afk) return sum
+      const end = r.endTime ? r.endTime.getTime() : r.timestamp.getTime()
+      return sum + Math.max(0, end - r.timestamp.getTime())
+    }, 0) / 1000 / 60)
 
     return `<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -698,7 +734,7 @@ body{font-family:var(--font-body);color:var(--ink-primary);background-color:var(
 <div class="date-badge">${date}</div>
 </div>
 </div>
-<div style="text-align:center;color:var(--ink-secondary);margin-bottom:30px;font-family:var(--font-hand)">设备: ${deviceId} · 统计时段: ${startHour}:00 - ${endHour}:59</div>
+<div style="text-align:center;color:var(--ink-secondary);margin-bottom:30px;font-family:var(--font-hand)">设备: ${deviceId} · 统计时段: ${startHour}:00 - ${endHour}:59 · 实际活跃: ${totalActiveMinutes}分钟 · AFK: ${afkMinutes}分钟</div>
 <div class="section">
 <div class="section-title">📊 24H 活跃轨迹</div>
 <div class="chart-box">
