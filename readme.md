@@ -20,11 +20,8 @@
 
 ### Koishi 插件安装
 
-在 Koishi 插件市场搜索 `monitorluna` 安装，或使用命令：
+在 Koishi 插件市场搜索 `monitorluna` 安装
 
-```bash
-npm install koishi-plugin-monitorluna
-```
 
 ### Windows Agent 安装
 
@@ -32,8 +29,8 @@ npm install koishi-plugin-monitorluna
 
 1. 前往 [Releases](https://github.com/lumia1998/koishi-plugin-monitorluna/releases/latest) 下载 `monitorluna-agent.zip`
 2. 解压到任意目录
-3. 双击运行 `start-server.bat`
-4. 脚本会自动检测并安装 Python 依赖
+3. 双击运行 `start-server.bat`或者`vbs`静默运行
+4. 脚本会使用uv创建虚拟环境
 5. 启动后会在系统托盘显示图标，右键点击"打开设置"配置连接信息
 
 #### 方式二：手动安装
@@ -50,7 +47,7 @@ Agent 启动后访问 http://127.0.0.1:6315 打开配置页面：
 | 配置项 | 说明 | 示例 |
 |--------|------|------|
 | Koishi WebSocket URL | Koishi 服务的 WebSocket 地址 | `ws://127.0.0.1:5140/monitorluna` |
-| Token | 与 Koishi 插件配置的 Token 一致 | `admin` |
+| Token | 与 Koishi 插件配置的 Token 一致 | 比如`admin` |
 | Device ID | 设备标识符，用于区分多台设备 | `my-pc`、`work-laptop` |
 
 配置保存后 Agent 会自动重新连接。系统托盘图标显示当前连接状态。
@@ -83,17 +80,6 @@ Agent 启动后访问 http://127.0.0.1:6315 打开配置页面：
 - `s3PublicUrl`：公网访问地址
 - `s3PathStyle`：是否使用路径风格 URL
 
-### 每日总结配置
-
-```yaml
-monitorluna:
-  dailySummaryEnabled: true
-  dailySummaryTime: '22:00'
-  dailySummaryTargets:
-    - deviceId: my-pc
-      channelIds:
-        - 'onebot:123456:987654321'
-```
 
 ## 🤖 命令
 
