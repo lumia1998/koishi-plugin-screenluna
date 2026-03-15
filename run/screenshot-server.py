@@ -464,12 +464,21 @@ class MonitorLunaAgent:
             self._ws = None
 
     async def _window_monitor(self, ws, device_id: str):
+        last_title = None
         while True:
             try:
                 if not self.paused:
                     info = await asyncio.get_event_loop().run_in_executor(None, get_window_info)
                     afk = await asyncio.get_event_loop().run_in_executor(None, is_afk)
                     key = (info["process"], info["title"])
+
+                    # 窗口标题变化也算活跃（视频播放、直播等场景）
+                    if info["title"] != last_title and info["title"]:
+                        import builtins
+                        # 直接写全局变量
+                        globals()["_last_input_time"] = time.time()
+                        last_title = info["title"]
+
                     # Send on window change OR always (to keep heartbeat endTime updated)
                     if key != self._last_window:
                         self._last_window = key
