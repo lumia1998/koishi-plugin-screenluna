@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<body>
+<canvas id="c16" width="16" height="16"></canvas>
+<canvas id="c48" width="48" height="48"></canvas>
+<canvas id="c128" width="128" height="128"></canvas>
+<script>
+function draw(id, size) {
+  const c = document.getElementById(id);
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#1E88E5';
+  ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = '#FFF';
+  ctx.font = `bold ${size*0.6}px Arial`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('M', size/2, size/2);
+}
+draw('c16', 16);
+draw('c48', 48);
+draw('c128', 128);
+</script>
+</body>
+</html>
