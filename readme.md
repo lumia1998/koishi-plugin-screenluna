@@ -10,10 +10,12 @@
 - 📊 **系统监控**：实时查看 CPU、内存、GPU 使用率
 - 🪟 **窗口追踪**：自动记录窗口切换，每 2 秒检测前台应用变化
 - ⌨️ **输入统计**：统计各应用的键盘按键、鼠标点击、滚轮滚动次数（Windows）
+- 🌐 **浏览器追踪**：追踪各域名活跃时长（Chrome/Edge扩展 + 油猴脚本）
 - 🖼️ **应用图标**：自动提取并显示应用程序图标（Windows）
 - 📅 **每日总结**：生成手绘风格活动总结图，包含活跃轨迹、输入统计 TOP 6、每小时 TOP 4
 - 🖼️ **定时截图**：每 15 分钟自动截图并存储
-- 💾 **多存储后端**：支持本地存储 / WebDAV / S3
+- 💾 **多存储后端**：支持本地存储 / WebDAV / S3（支持 S3 V4 签名）
+- 🗄️ **本地 SQLite**：Agent 端数据本地存储，减轻服务器压力
 - 🔐 **Token 鉴权**：WebSocket 连接需要 Token 验证
 
 ## 📦 安装
@@ -51,6 +53,26 @@ Agent 启动后访问 http://127.0.0.1:6315 打开配置页面：
 | Device ID | 设备标识符，用于区分多台设备 | `my-pc`、`work-laptop` |
 
 配置保存后 Agent 会自动重新连接。系统托盘图标显示当前连接状态。
+
+### 浏览器扩展安装（可选）
+
+追踪浏览器各域名活跃时长，支持两种方式：
+
+#### 方式一：Chrome/Edge 扩展
+
+1. 打开 `chrome://extensions/` 并启用"开发者模式"
+2. 点击"加载已解压的扩展程序"
+3. 选择项目中的 `browser-extension` 文件夹
+4. 点击扩展图标配置连接信息（与 Agent 相同）
+
+#### 方式二：油猴脚本（通用）
+
+1. 安装 Tampermonkey 或 Violentmonkey 扩展
+2. 打开 `browser-extension/monitorluna.user.js`
+3. 点击"安装"
+4. 点击脚本管理器图标 → "MonitorLuna 设置"配置连接
+
+详见 [browser-extension/README.md](browser-extension/README.md)
 
 ## 🔧 Koishi 插件配置
 
@@ -108,9 +130,16 @@ Agent 启动后访问 http://127.0.0.1:6315 打开配置页面：
 ```
 koishi-plugin-monitorluna/
 ├── src/
-│   └── index.ts          # Koishi 插件主文件
-├── screenshot-server.py  # Windows Agent
-├── start-server.bat      # Windows 一键启动脚本
+│   └── index.ts              # Koishi 插件主文件
+├── browser-extension/        # 浏览器扩展
+│   ├── manifest.json         # Chrome/Edge 扩展配置
+│   ├── background.js         # 后台服务
+│   ├── popup.html/js         # 配置界面
+│   ├── monitorluna.user.js   # 油猴脚本版本
+│   └── README.md             # 扩展说明
+├── screenshot-server.py      # Agent 主程序
+├── start-server.bat          # Windows 一键启动
+├── SECURITY_FIXES.md         # 安全修复文档
 └── readme.md
 ```
 
