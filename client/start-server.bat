@@ -1,31 +1,31 @@
 @echo off
 cd /d "%~dp0"
 
-REM 检查本地 uv.exe 是否存在
+REM Check local uv.exe
 if exist "%~dp0uv.exe" (
     set UV="%~dp0uv.exe"
     goto :run
 )
 
-REM 检查系统 PATH 中是否有 uv
+REM Check system uv
 where uv >nul 2>&1
 if %errorlevel% == 0 (
     set UV=uv
     goto :run
 )
 
-REM 下载 uv 到当前目录
-echo 正在下载 uv 包管理器...
+REM Download uv to current directory
+echo Downloading uv...
 powershell -ExecutionPolicy Bypass -Command "$env:UV_INSTALL_DIR='%~dp0'; irm https://astral.sh/uv/install.ps1 | iex"
 if exist "%~dp0uv.exe" (
     set UV="%~dp0uv.exe"
     goto :run
 )
-echo uv 下载失败，请检查网络连接后重试
+echo Failed to download uv
 pause
 exit /b 1
 
 :run
-echo 正在启动 MonitorLuna Agent...
-%UV% run --project "%~dp0" python "%~dp0screenshot-server.py"
+echo Starting MonitorLuna Agent...
+%UV% run screenshot-server.py
 pause

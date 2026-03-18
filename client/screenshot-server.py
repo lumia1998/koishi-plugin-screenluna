@@ -51,6 +51,9 @@ DEFAULT_CONFIG = {
     "url": "ws://127.0.0.1:5140/monitorluna",
     "token": "",
     "device_id": os.environ.get("COMPUTERNAME", "my-pc"),
+    "screenshot_enabled": False,
+    "screenshot_interval": 15,
+    "browser_token": "",
 }
 
 
@@ -92,9 +95,20 @@ def init_database():
         )
     """)
 
+    # 浏览器活动表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS browser_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT NOT NULL,
+            seconds REAL DEFAULT 0,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # 创建索引
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity(timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_input_stats_timestamp ON input_stats(timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_browser_activity_timestamp ON browser_activity(timestamp)")
 
     conn.commit()
     conn.close()
@@ -159,7 +173,23 @@ _input_stats_lock = threading.Lock()
 _app_stats = {}  # process_name -> {display_name, key_presses, left_clicks, right_clicks, scroll_distance}
 _icon_cache = {}  # process_name -> base64 string
 
+# 浏览器活动统计（由本地 /ws/browser 端点接收）
+_browser_stats_lock = threading.Lock()
+_browser_stats = {}  # domain -> seconds
+
 if IS_WINDOWS and WINDOWS_FEATURES:
+    import ctypes
+    from ctypes import wintypes
+
+    # 声明 CallNextHookEx 的参数类型，避免 64 位 Windows 上 lParam 溢出
+    windll.user32.CallNextHookEx.restype = wintypes.LPARAM
+    windll.user32.CallNextHookEx.argtypes = [
+        wintypes.HHOOK,   # hhk
+        c_int,            # nCode
+        wintypes.WPARAM,  # wParam
+        wintypes.LPARAM,  # lParam
+    ]
+
     # Windows 钩子常量
     WH_KEYBOARD_LL = 13
     WH_MOUSE_LL = 14
@@ -198,11 +228,10 @@ if IS_WINDOWS and WINDOWS_FEATURES:
 
     def _keyboard_proc(nCode, wParam, lParam):
         if nCode >= 0:
-            # 从 lParam 读取虚拟键码（KBDLLHOOKSTRUCT 第一个字段）
-            import ctypes
-            vk_code = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_ulong))[0]
+            # lParam 是 LPARAM（整数），转为指针后读取 KBDLLHOOKSTRUCT.vkCode
+            ptr = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_ulong))
+            vk_code = ptr[0]
             if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                # 只在键第一次按下时计数，忽略长按重复
                 if vk_code not in _pressed_keys:
                     _pressed_keys.add(vk_code)
                     process_name = _get_current_process_name()
@@ -224,16 +253,16 @@ if IS_WINDOWS and WINDOWS_FEATURES:
                     elif wParam == WM_RBUTTONDOWN:
                         _app_stats[process_name]["right_clicks"] += 1
                     elif wParam == WM_MOUSEWHEEL:
-                        # 从 MSLLHOOKSTRUCT.mouseData 高位字取滚动 delta，除以 120 得格数
-                        import ctypes
-                        mouse_data = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_ulong))[2]
+                        # lParam 是 LPARAM（整数），转为指针读取 MSLLHOOKSTRUCT.mouseData
+                        ptr = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_ulong))
+                        mouse_data = ptr[2]
                         delta = ctypes.c_short(mouse_data >> 16).value
                         ticks = abs(delta) / WHEEL_DELTA
                         _app_stats[process_name]["scroll_distance"] += ticks
         return windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-    KEYBOARD_PROC_TYPE = WINFUNCTYPE(c_int, c_int, c_void_p, c_void_p)
-    MOUSE_PROC_TYPE = WINFUNCTYPE(c_int, c_int, c_void_p, c_void_p)
+    KEYBOARD_PROC_TYPE = WINFUNCTYPE(wintypes.LPARAM, c_int, wintypes.WPARAM, wintypes.LPARAM)
+    MOUSE_PROC_TYPE = WINFUNCTYPE(wintypes.LPARAM, c_int, wintypes.WPARAM, wintypes.LPARAM)
     _kb_proc_ref = KEYBOARD_PROC_TYPE(_keyboard_proc)
     _ms_proc_ref = MOUSE_PROC_TYPE(_mouse_proc)
 
@@ -467,6 +496,7 @@ def query_daily_data(date_str: str = None) -> dict:
             GROUP BY process
         """, (start_time, end_time))
         input_stats = {}
+        icon_hashes = set()
         for row in cursor.fetchall():
             input_stats[row[0]] = {
                 "display_name": row[1],
@@ -476,12 +506,64 @@ def query_daily_data(date_str: str = None) -> dict:
                 "right_clicks": row[5],
                 "scroll_distance": row[6]
             }
+            if row[2]:
+                icon_hashes.add(row[2])
+
+        # 查询浏览器活动
+        cursor.execute("""
+            SELECT domain, SUM(seconds) FROM browser_activity
+            WHERE timestamp BETWEEN ? AND ?
+            GROUP BY domain
+        """, (start_time, end_time))
+        browser_activity = {}
+        for row in cursor.fetchall():
+            browser_activity[row[0]] = row[1]
+
+        # 查询图标数据
+        icons = {}
+        if icon_hashes:
+            placeholders = ','.join('?' * len(icon_hashes))
+            cursor.execute(f"SELECT hash, data FROM icons WHERE hash IN ({placeholders})", tuple(icon_hashes))
+            for row in cursor.fetchall():
+                icons[row[0]] = row[1]
 
         conn.close()
-        return {"activities": activities, "input_stats": input_stats}
+        return {
+            "activities": activities,
+            "input_stats": input_stats,
+            "browser_activity": browser_activity,
+            "icons": icons
+        }
     except Exception as e:
         print(f"Failed to query daily data: {e}")
-        return {"activities": [], "input_stats": {}}
+        return {"activities": [], "input_stats": {}, "browser_activity": {}, "icons": {}}
+
+
+def get_browser_stats_snapshot() -> dict:
+    """返回当前浏览器活动快照并存入本地数据库"""
+    with _browser_stats_lock:
+        snapshot = dict(_browser_stats)
+        _browser_stats.clear()
+
+    if not snapshot:
+        return {}
+
+    # 存储到本地数据库
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        timestamp = datetime.now().isoformat()
+        for domain, seconds in snapshot.items():
+            cursor.execute(
+                "INSERT INTO browser_activity (domain, seconds, timestamp) VALUES (?, ?, ?)",
+                (domain, seconds, timestamp)
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Failed to save browser stats: {e}")
+
+    return snapshot
 
 
 # ── 窗口信息 ──────────────────────────────────────────────────────────────────
@@ -517,8 +599,18 @@ def get_system_status() -> dict:
 
 
 # ── 截图 ──────────────────────────────────────────────────────────────────────
+def _save_to_screen_dir(img):
+    """按需截图保存到 screen 目录"""
+    now = datetime.now()
+    date_dir = Path(__file__).parent / "screen" / now.strftime("%Y-%m-%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+    filename = date_dir / f"screenshot_{now.strftime('%H%M%S')}.jpg"
+    img.save(filename, "JPEG", quality=85)
+
+
 def take_screenshot() -> str:
     img = pyautogui.screenshot()
+    _save_to_screen_dir(img)
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=85)
     return base64.b64encode(buf.getvalue()).decode()
@@ -531,8 +623,8 @@ def take_window_screenshot() -> str:
         x, y, x2, y2 = rect
         img = pyautogui.screenshot(region=(x, y, x2 - x, y2 - y))
     else:
-        # 非 Windows 平台退回全屏截图
         img = pyautogui.screenshot()
+    _save_to_screen_dir(img)
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=85)
     return base64.b64encode(buf.getvalue()).decode()
@@ -548,6 +640,8 @@ class MonitorLunaAgent:
         self._loop = None
         self._ws = None
         self._last_window = None
+        self._stats_task = None
+        self._screenshot_task = None
         start_input_monitoring()  # 启动输入监听
 
     def reload_config(self):
@@ -596,7 +690,6 @@ class MonitorLunaAgent:
                 self.status = f"已连接 ✓ ({cfg['device_id']})"
                 self._last_window = None
                 monitor_task = asyncio.get_event_loop().create_task(self._window_monitor(ws, cfg["device_id"]))
-                stats_task = asyncio.get_event_loop().create_task(self._input_stats_sender(ws, cfg["device_id"]))
                 try:
                     async for raw in ws:
                         if not self.running:
@@ -610,7 +703,6 @@ class MonitorLunaAgent:
                             await ws.send(json.dumps(resp, ensure_ascii=False))
                 finally:
                     monitor_task.cancel()
-                    stats_task.cancel()
                     self._ws = None
         except Exception as e:
             self.status = f"断开: {e}"
@@ -624,33 +716,45 @@ class MonitorLunaAgent:
                 key = (info["process"], info["title"])
                 if key != self._last_window:
                     self._last_window = key
-                    # 存储到本地数据库
+                    # 只存储到本地数据库
                     await asyncio.get_event_loop().run_in_executor(None, save_activity_to_db, info["process"], info["title"])
-                    # 发送到 Koishi（可选，用于实时监控）
-                    await ws.send(json.dumps({
-                        "type": "activity",
-                        "device_id": device_id,
-                        "process": info["process"],
-                        "title": info["title"],
-                        "pid": info["pid"],
-                    }, ensure_ascii=False))
             except Exception:
                 pass
             await asyncio.sleep(2)
 
-    async def _input_stats_sender(self, ws, device_id: str):
+    async def _input_stats_sender(self):
+        """定期保存输入统计和浏览器活动到本地数据库"""
         while True:
-            await asyncio.sleep(30)  # 每 30 秒发送一次
+            await asyncio.sleep(30)
             try:
                 stats = await asyncio.get_event_loop().run_in_executor(None, get_input_stats_snapshot)
-                if stats:
-                    await ws.send(json.dumps({
-                        "type": "input_stats",
-                        "device_id": device_id,
-                        "stats": stats,
-                    }, ensure_ascii=False))
             except Exception:
                 pass
+            try:
+                browser_stats = await asyncio.get_event_loop().run_in_executor(None, get_browser_stats_snapshot)
+            except Exception:
+                pass
+
+    async def _screenshot_task_loop(self):
+        """本地定时截图任务"""
+        while self.running:
+            cfg = self.config
+            if not cfg.get("screenshot_enabled", False):
+                await asyncio.sleep(60)
+                continue
+
+            interval = cfg.get("screenshot_interval", 15) * 60
+            try:
+                img = await asyncio.get_event_loop().run_in_executor(None, pyautogui.screenshot)
+                now = datetime.now()
+                date_dir = Path(__file__).parent / "cronscreen" / now.strftime("%Y-%m-%d")
+                date_dir.mkdir(parents=True, exist_ok=True)
+                filename = date_dir / f"screenshot_{now.strftime('%H%M')}.jpg"
+                await asyncio.get_event_loop().run_in_executor(None, lambda: img.save(filename, "JPEG", quality=85))
+            except Exception as e:
+                print(f"Screenshot failed: {e}")
+
+            await asyncio.sleep(interval)
 
     async def run_forever(self):
         delay = 3
@@ -668,12 +772,19 @@ class MonitorLunaAgent:
         def _thread():
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
+            # 启动独立的后台任务
+            self._stats_task = self._loop.create_task(self._input_stats_sender())
+            self._screenshot_task = self._loop.create_task(self._screenshot_task_loop())
             self._loop.run_until_complete(self.run_forever())
         t = threading.Thread(target=_thread, daemon=True)
         t.start()
 
     def stop(self):
         self.running = False
+        if self._stats_task:
+            self._stats_task.cancel()
+        if self._screenshot_task:
+            self._screenshot_task.cancel()
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)
 
@@ -690,7 +801,9 @@ body{font-family:sans-serif;max-width:600px;margin:40px auto;padding:20px;backgr
 h1{margin:0 0 20px;font-size:24px;color:#333}
 .status{padding:12px;background:#e3f2fd;border-radius:4px;margin-bottom:20px;color:#1976d2}
 label{display:block;margin:16px 0 6px;font-weight:600;color:#555}
-input{width:100%;padding:10px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;font-size:14px}
+input[type="text"],input[type="password"],input[type="number"]{width:100%;padding:10px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;font-size:14px}
+input[type="checkbox"]{margin-right:8px}
+.checkbox-label{display:flex;align-items:center;margin:16px 0}
 button{background:#1976d2;color:#fff;border:none;padding:12px 24px;border-radius:4px;cursor:pointer;font-size:14px;margin-top:20px}
 button:hover{background:#1565c0}
 .msg{padding:12px;margin-top:16px;border-radius:4px;display:none}
@@ -709,6 +822,14 @@ button:hover{background:#1565c0}
 <input type="password" id="token" placeholder="与 Koishi 配置一致" required>
 <label>Device ID</label>
 <input type="text" id="device_id" placeholder="my-pc" required>
+<div class="checkbox-label">
+<input type="checkbox" id="screenshot_enabled">
+<label for="screenshot_enabled" style="margin:0">启用本地定时截图</label>
+</div>
+<label>截图间隔（分钟）</label>
+<input type="number" id="screenshot_interval" min="1" max="120" value="15">
+<label>浏览器扩展密码</label>
+<input type="password" id="browser_token" placeholder="留空则不启用鉴权">
 <button type="submit">保存并重连</button>
 </form>
 <div class="msg" id="msg"></div>
@@ -720,6 +841,9 @@ async function load(){
   document.getElementById('url').value=d.url;
   document.getElementById('token').value=d.token;
   document.getElementById('device_id').value=d.device_id;
+  document.getElementById('screenshot_enabled').checked=d.screenshot_enabled||false;
+  document.getElementById('screenshot_interval').value=d.screenshot_interval||15;
+  document.getElementById('browser_token').value=d.browser_token||'';
   updateStatus();
 }
 async function updateStatus(){
@@ -732,7 +856,10 @@ document.getElementById('form').onsubmit=async(e)=>{
   const data={
     url:document.getElementById('url').value,
     token:document.getElementById('token').value,
-    device_id:document.getElementById('device_id').value
+    device_id:document.getElementById('device_id').value,
+    screenshot_enabled:document.getElementById('screenshot_enabled').checked,
+    screenshot_interval:parseInt(document.getElementById('screenshot_interval').value),
+    browser_token:document.getElementById('browser_token').value
   };
   const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
   const msg=document.getElementById('msg');
@@ -769,14 +896,16 @@ async def handle_get_config(request):
 async def handle_post_config(request):
     agent = request.app["agent"]
     data = await request.json()
-    allowed_keys = {"url", "token", "device_id"}
+    allowed_keys = {"url", "token", "device_id", "screenshot_enabled", "screenshot_interval", "browser_token"}
     filtered = {k: v for k, v in data.items() if k in allowed_keys}
     if filtered.get("token") == "***":
         filtered["token"] = agent.config.get("token", "")
+    if filtered.get("browser_token") == "***":
+        filtered["browser_token"] = agent.config.get("browser_token", "")
     save_config({**agent.config, **filtered})
     agent.stop()
     await asyncio.sleep(0.5)
-    agent.config = data
+    agent.config = {**agent.config, **filtered}
     agent.running = True
     agent.start_in_thread()
     return web.json_response({"ok": True})
@@ -787,6 +916,47 @@ async def handle_status(request):
     return web.json_response({"status": agent.status})
 
 
+# ── 浏览器扩展 WebSocket 端点 ─────────────────────────────────────────────────
+async def handle_browser_ws(request):
+    """接收浏览器扩展的 WebSocket 连接，汇总活动数据"""
+    agent = request.app["agent"]
+    ws_response = web.WebSocketResponse()
+    await ws_response.prepare(request)
+
+    authenticated = False
+    async for msg in ws_response:
+        if msg.type == web.WSMsgType.TEXT:
+            try:
+                data = json.loads(msg.data)
+            except Exception:
+                continue
+
+            if data.get("type") == "hello":
+                browser_token = agent.config.get("browser_token", "")
+                if browser_token and data.get("token") != browser_token:
+                    await ws_response.send_json({"type": "error", "message": "invalid token"})
+                    await ws_response.close()
+                    break
+                authenticated = True
+                await ws_response.send_json({"type": "hello_ack", "message": "connected"})
+                continue
+
+            if not authenticated:
+                await ws_response.send_json({"type": "error", "message": "send hello first"})
+                continue
+
+            if data.get("type") == "browser_activity":
+                stats = data.get("stats", {})
+                with _browser_stats_lock:
+                    for domain, seconds in stats.items():
+                        if isinstance(seconds, (int, float)) and seconds > 0:
+                            _browser_stats[domain] = _browser_stats.get(domain, 0) + seconds
+        elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
+            break
+
+    return ws_response
+
+
 def start_webui(agent: MonitorLunaAgent):
     app = web.Application()
     app["agent"] = agent
@@ -794,6 +964,7 @@ def start_webui(agent: MonitorLunaAgent):
     app.router.add_get("/api/config", handle_get_config)
     app.router.add_post("/api/config", handle_post_config)
     app.router.add_get("/api/status", handle_status)
+    app.router.add_get("/ws/browser", handle_browser_ws)
     web.run_app(app, host="127.0.0.1", port=WEBUI_PORT, print=None)
 
 

@@ -3,4 +3,11 @@ lib/
 *.log
 .DS_Store
 .claude/
-config.json
+client/config.json
+__pycache__/
+client/__pycache__/
+client/.venv/
+client/*.db
+client/screen/
+client/cronscreen/
+monitorluna-agent.zip

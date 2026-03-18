@@ -2,148 +2,120 @@
 
 [![npm](https://img.shields.io/npm/v/koishi-plugin-monitorluna?style=flat-square)](https://www.npmjs.com/package/koishi-plugin-monitorluna)
 
-远程设备监控插件，通过 WebSocket 连接 Windows/Linux 后台 Agent，实现远程截图、系统监控、窗口活动追踪、输入统计和每日总结生成。
+远程设备监控插件，通过 WebSocket 连接本地 Agent，实现远程截图、系统状态查看、窗口活动追踪、浏览器活动统计和每日总结图片生成。
 
-## ✨ 功能特性
+## 功能
 
-- 📸 **远程截图**：全屏截图 / 当前活跃窗口截图
-- 📊 **系统监控**：实时查看 CPU、内存、GPU 使用率
-- 🪟 **窗口追踪**：自动记录窗口切换，每 2 秒检测前台应用变化
-- ⌨️ **输入统计**：统计各应用的键盘按键、鼠标点击、滚轮滚动次数（Windows）
-- 🌐 **浏览器追踪**：追踪各域名活跃时长（Chrome/Edge扩展 + 油猴脚本）
-- 🖼️ **应用图标**：自动提取并显示应用程序图标（Windows）
-- 📅 **每日总结**：生成手绘风格活动总结图，包含活跃轨迹、输入统计 TOP 6、每小时 TOP 4
-- 🖼️ **定时截图**：每 15 分钟自动截图并存储
-- 💾 **多存储后端**：支持本地存储 / WebDAV / S3（支持 S3 V4 签名）
-- 🗄️ **本地 SQLite**：Agent 端数据本地存储，减轻服务器压力
-- 🔐 **Token 鉴权**：WebSocket 连接需要 Token 验证
+- 远程截图：全屏截图和当前活跃窗口截图。
+- 系统状态：查看 CPU、内存、GPU 使用率。
+- 窗口追踪：轮询在线设备的前台窗口变化并推送截图。
+- 浏览器统计：通过 `client/monitorluna.user.js` 上报域名活跃时长到本地 Agent。
+- 每日总结：渲染活动总结图并支持定时推送。
+- 多存储后端：支持本地存储、WebDAV 和 S3。
+- 截图记录：截图 URL 和类型会写入 Koishi 数据库表 `monitorluna_screenshot`。
 
-## 📦 安装
+## 安装
 
-### Koishi 插件安装
+### Koishi 插件
 
-在 Koishi 插件市场搜索 `monitorluna` 安装
+安装 `koishi-plugin-monitorluna`，并确保同时具备：
 
+- `@koishijs/plugin-server`
+- 数据库插件，例如 SQLite / MySQL / PostgreSQL
+- `@koishijs/plugin-puppeteer`，仅在需要生成总结图时安装
 
-### Windows Agent 安装
+### Windows Agent
 
-#### 方式一：一键启动（推荐）
+Agent 相关文件现在统一放在 [`client/`](./client) 目录。
 
-1. 前往 [Releases](https://github.com/lumia1998/koishi-plugin-monitorluna/releases/latest) 下载 `monitorluna-agent.zip`
-2. 解压到任意目录
-3. 双击运行 `start-server.bat`或者`vbs`静默运行
-4. 脚本会使用uv创建虚拟环境
-5. 启动后会在系统托盘显示图标，右键点击"打开设置"配置连接信息
+方式一：使用启动脚本
 
-#### 方式二：手动安装
+1. 打开 [`client/start-server.bat`](./client/start-server.bat) 启动 Agent。
+2. 如果需要静默启动，运行 [`client/start-silent.vbs`](./client/start-silent.vbs)。
+3. 首次启动会尝试使用 `uv` 运行 [`client/screenshot-server.py`](./client/screenshot-server.py)。
+
+方式二：手动运行
 
 ```bash
-pip install websockets pyautogui pillow psutil pystray aiohttp pywin32 wmi GPUtil
+cd client
+pip install -r requirements.txt
 python screenshot-server.py
 ```
 
-## ⚙️ Agent 配置
+也可以使用 [`client/pyproject.toml`](./client/pyproject.toml) 配合 `uv` 安装依赖。
 
-Agent 启动后访问 http://127.0.0.1:6315 打开配置页面：
+## Agent 配置
 
-| 配置项 | 说明 | 示例 |
-|--------|------|------|
-| Koishi WebSocket URL | Koishi 服务的 WebSocket 地址 | `ws://127.0.0.1:5140/monitorluna` |
-| Token | 与 Koishi 插件配置的 Token 一致 | 比如`admin` |
-| Device ID | 设备标识符，用于区分多台设备 | `my-pc`、`work-laptop` |
+启动后访问 `http://127.0.0.1:6315` 打开本地配置页面。
 
-配置保存后 Agent 会自动重新连接。系统托盘图标显示当前连接状态。
+主要配置项：
 
-### 浏览器扩展安装（可选）
+- `Koishi WebSocket URL`：例如 `ws://127.0.0.1:5140/monitorluna`。
+- `Token`：必须与 Koishi 插件配置一致。
+- `Device ID`：设备唯一标识。
+- `浏览器扩展密码`：给浏览器脚本连接 `ws://127.0.0.1:6315/ws/browser` 用，可留空。
 
-追踪浏览器各域名活跃时长，支持两种方式：
+Agent 会在 `client/monitorluna.db` 中保存活动记录、输入统计、浏览器统计和图标缓存。
 
-#### 方式一：Chrome/Edge 扩展
+## 浏览器统计
 
-1. 打开 `chrome://extensions/` 并启用"开发者模式"
-2. 点击"加载已解压的扩展程序"
-3. 选择项目中的 `browser-extension` 文件夹
-4. 点击扩展图标配置连接信息（与 Agent 相同）
+当前仓库内保留的是油猴脚本版本：[`client/monitorluna.user.js`](./client/monitorluna.user.js)。
 
-#### 方式二：油猴脚本（通用）
+使用方式：
 
-1. 安装 Tampermonkey 或 Violentmonkey 扩展
-2. 打开 `browser-extension/monitorluna.user.js`
-3. 点击"安装"
-4. 点击脚本管理器图标 → "MonitorLuna 设置"配置连接
+1. 安装 Tampermonkey 或 Violentmonkey。
+2. 导入 [`client/monitorluna.user.js`](./client/monitorluna.user.js)。
+3. 在脚本菜单中配置本地 Agent 地址，默认是 `ws://127.0.0.1:6315/ws/browser`。
+4. 如已设置浏览器扩展密码，脚本内也要填写相同 token。
 
-详见 [browser-extension/README.md](browser-extension/README.md)
+## Koishi 配置
 
-## 🔧 Koishi 插件配置
+基础配置：
 
-### 基础配置
+- `token`：必填，Agent 握手 token。
+- `commandTimeout`：命令超时时间，默认 `15000`。
+- `debug`：是否输出调试日志。
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| token | - | 鉴权密钥，需与 Agent 一致 |
-| serverPath | - | Koishi 公网地址（本地存储时用于生成图片 URL） |
-| commandTimeout | 15000 | 指令超时时间（ms） |
-| debug | false | 开启调试日志 |
+存储配置：
 
-### 存储配置
+- `storageType=local`：使用 `storagePath` 保存图片，本地 URL 基于 `serverPath` 或 Koishi `selfUrl` 生成。
+- `storageType=webdav`：需要 `webdavEndpoint`、`webdavUsername`、`webdavPassword`，可选 `webdavPublicUrl`。
+- `storageType=s3`：需要 `s3Endpoint`、`s3Bucket`、`s3AccessKeyId`、`s3SecretAccessKey`，可选 `s3Region`、`s3PublicUrl`、`s3PathStyle`。
 
-**本地存储（默认）：**
-- `storagePath`：存储目录，默认 `data/monitorluna`
-- `serverPath`：Koishi 公网访问地址，用于生成图片链接
+推送配置：
 
-**WebDAV：**
-- `webdavEndpoint`：WebDAV 端点地址
-- `webdavUsername` / `webdavPassword`：认证信息
-- `webdavPublicUrl`：公网访问地址
+- `pushChannelIds`：群聊目标，格式 `platform:selfId:channelId`。
+- `pushPrivateIds`：私聊目标，格式 `platform:selfId:userId`。
+- `pushPollInterval`：窗口切换轮询间隔。
+- `dailySummaryEnabled`：是否启用每日总结推送。
+- `dailySummaryTime`：每日总结时间，格式 `HH:mm`。
 
-**S3：**
-- `s3Endpoint` / `s3Bucket` / `s3Region`
-- `s3AccessKeyId` / `s3SecretAccessKey`
-- `s3PublicUrl`：公网访问地址
-- `s3PathStyle`：是否使用路径风格 URL
+## 命令
 
+- `monitor.list`：列出在线设备。
+- `monitor.screen <设备ID>`：截取设备全屏并返回图片。
+- `monitor.window <设备ID>`：截取当前活跃窗口并返回图片。
+- `monitor.status <设备ID>`：查看设备 CPU / 内存 / GPU 状态。
+- `monitor.analytics <设备ID>`：生成当天活动总结图。
 
-## 🤖 命令
+## 项目结构
 
-| 命令 | 说明 |
-|------|------|
-| `monitor.list` | 列出所有在线设备 |
-| `monitor.screen <设备ID>` | 截取设备全屏截图 |
-| `monitor.window <设备ID>` | 截取设备当前活跃窗口 |
-| `monitor.status <设备ID>` | 查看设备 CPU/内存/GPU 状态 |
-| `monitor.analytics <设备ID>` | 生成当天活动总结图（需要 puppeteer 插件） |
-
-## 📊 每日总结说明
-
-总结图包含三个部分：
-
-1. **24H 活跃轨迹**：柱状图显示每小时的活跃度
-2. **全天活跃时间 TOP 4**：全天活跃时长最长的 4 个应用
-3. **每小时 TOP 4**：每个小时内活跃时长最长的 4 个应用
-
-统计逻辑：通过记录相邻两次窗口切换的时间差来计算各应用的使用时长，从当天实际开机使用时刻开始统计。
-
-需要安装 `@koishijs/plugin-puppeteer` 插件才能渲染总结图。
-
-## 📁 项目结构
-
-```
+```text
 koishi-plugin-monitorluna/
 ├── src/
-│   └── index.ts              # Koishi 插件主文件
-├── browser-extension/        # 浏览器扩展
-│   ├── manifest.json         # Chrome/Edge 扩展配置
-│   ├── background.js         # 后台服务
-│   ├── popup.html/js         # 配置界面
-│   ├── monitorluna.user.js   # 油猴脚本版本
-│   └── README.md             # 扩展说明
-├── screenshot-server.py      # Agent 主程序
-├── start-server.bat          # Windows 一键启动
-├── SECURITY_FIXES.md         # 安全修复文档
+│   └── index.ts
+├── client/
+│   ├── screenshot-server.py
+│   ├── start-server.bat
+│   ├── start-silent.vbs
+│   ├── requirements.txt
+│   ├── pyproject.toml
+│   └── monitorluna.user.js
+├── .github/workflows/release.yml
+├── package.json
 └── readme.md
 ```
 
-## 📝 License
+## 发布说明
 
-MIT
-
+GitHub Release workflow 会从 `client/` 目录打包 Agent。发布前请确认 `client/` 内脚本与依赖文件完整。

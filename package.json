@@ -27,12 +27,15 @@
   "peerDependencies": {
     "koishi": "^4.0.0",
     "@koishijs/plugin-server": "^3.0.0",
-    "koishi-plugin-puppeteer": "*"
+    "@koishijs/plugin-puppeteer": "^3.0.0"
   },
   "peerDependenciesMeta": {
-    "koishi-plugin-puppeteer": {
+    "@koishijs/plugin-puppeteer": {
       "optional": true
     }
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "koishi": "^4.0.0",

@@ -17,16 +17,14 @@ jobs:
 
       - name: Package agent
         run: |
-          cd run
+          cd client
           zip -r ../monitorluna-agent.zip \
             screenshot-server.py \
             start-silent.vbs \
-            start.bat \
+            start-server.bat \
             pyproject.toml \
-            README.md \
-            uv.exe \
-            uvw.exe \
-            uvx.exe \
+            requirements.txt \
+            monitorluna.user.js \
             uv.lock
 
       - name: Create Release

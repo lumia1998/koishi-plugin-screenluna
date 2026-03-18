@@ -37,44 +37,16 @@ export const inject = {
 // ── Database Tables ──
 declare module 'koishi' {
   interface Tables {
-    monitorluna_activity: ActivityLog
     monitorluna_screenshot: Screenshot
-    monitorluna_input_stats: InputStats
-    monitorluna_icon: IconData
   }
-}
-
-interface ActivityLog {
-  id: number
-  deviceId: string
-  process: string
-  title: string
-  timestamp: Date
 }
 
 interface Screenshot {
   id: number
   deviceId: string
   url: string
+  type: 'manual' | 'push' | 'daily' | 'analytics'
   timestamp: Date
-}
-
-interface InputStats {
-  id: number
-  deviceId: string
-  process: string
-  displayName: string
-  iconHash: string
-  keyPresses: number
-  leftClicks: number
-  rightClicks: number
-  scrollDistance: number
-  timestamp: Date
-}
-
-interface IconData {
-  hash: string
-  data: string
 }
 
 // ── Storage Backend Interface ──
@@ -117,8 +89,8 @@ class LocalStorage implements StorageBackend {
   async upload(buffer: Buffer, filename: string) {
     const filepath = path.join(this.dir, filename)
     await fs.writeFile(filepath, buffer)
-    const baseUrl = this.config.serverPath || 'http://127.0.0.1:5140'
-    return { key: filename, url: `${baseUrl}/monitorluna/${filename}` }
+    const baseUrl = this.config.serverPath || this.ctx.root.config.selfUrl || 'http://127.0.0.1:5140'
+    return { key: filename, url: `${baseUrl.replace(/\/$/, '')}/monitorluna/${filename}` }
   }
 
   async delete(key: string) {
@@ -127,22 +99,28 @@ class LocalStorage implements StorageBackend {
 
   async cleanup(days: number) {
     const cutoff = Date.now() - days * 86400000
-    const files = await fs.readdir(this.dir)
-    for (const file of files) {
-      const stat = await fs.stat(path.join(this.dir, file))
-      if (stat.mtimeMs < cutoff) await this.delete(file)
+    try {
+      const files = await fs.readdir(this.dir)
+      for (const file of files) {
+        if (file === '.keep') continue
+        const stat = await fs.stat(path.join(this.dir, file))
+        if (stat.mtimeMs < cutoff) await this.delete(file)
+      }
+    } catch (e) {
+      this.ctx.logger.warn(`[monitorluna] 本地清理失败: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
 }
 
 // ── WebDAV Storage ──
 class WebDAVStorage implements StorageBackend {
-  constructor(private config: Config) { }
+  constructor(private config: Config, private ctx: Context) { }
 
   async init() { }
 
   async upload(buffer: Buffer, filename: string) {
-    const url = `${this.config.webdavEndpoint}/${filename}`
+    const endpoint = this.config.webdavEndpoint!
+    const url = `${endpoint.replace(/\/$/, '')}/${filename}`
     const auth = Buffer.from(`${this.config.webdavUsername}:${this.config.webdavPassword}`).toString('base64')
     const res = await fetch(url, {
       method: 'PUT',
@@ -150,12 +128,13 @@ class WebDAVStorage implements StorageBackend {
       body: buffer as unknown as BodyInit
     })
     if (!res.ok) throw new Error(`WebDAV upload failed: ${res.status} ${res.statusText}`)
-    const publicUrl = this.config.webdavPublicUrl || this.config.webdavEndpoint
-    return { key: filename, url: `${publicUrl}/${filename}` }
+    const publicUrl = this.config.webdavPublicUrl || endpoint
+    return { key: filename, url: `${publicUrl.replace(/\/$/, '')}/${filename}` }
   }
 
   async delete(key: string) {
-    const url = `${this.config.webdavEndpoint}/${key}`
+    const endpoint = this.config.webdavEndpoint!
+    const url = `${endpoint.replace(/\/$/, '')}/${key}`
     const auth = Buffer.from(`${this.config.webdavUsername}:${this.config.webdavPassword}`).toString('base64')
     await fetch(url, { method: 'DELETE', headers: { 'Authorization': `Basic ${auth}` } }).catch(() => { })
   }
@@ -164,7 +143,7 @@ class WebDAVStorage implements StorageBackend {
     const cutoff = Date.now() - days * 86400000
     try {
       const auth = Buffer.from(`${this.config.webdavUsername}:${this.config.webdavPassword}`).toString('base64')
-      const res = await fetch(this.config.webdavEndpoint, {
+      const res = await fetch(this.config.webdavEndpoint!, {
         method: 'PROPFIND',
         headers: {
           'Authorization': `Basic ${auth}`,
@@ -186,13 +165,15 @@ class WebDAVStorage implements StorageBackend {
           if (filename) await this.delete(filename)
         }
       }
-    } catch { }
+    } catch (e) {
+      this.ctx.logger.warn(`[monitorluna] WebDAV 清理失败: ${e instanceof Error ? e.message : String(e)}`)
+    }
   }
 }
 
 // ── S3 Storage ──
 class S3Storage implements StorageBackend {
-  constructor(private config: Config) { }
+  constructor(private config: Config, private ctx: Context) { }
 
   async init() { }
 
@@ -201,8 +182,10 @@ class S3Storage implements StorageBackend {
     const headers = await this.signRequestV4('PUT', filename, buffer)
     const res = await fetch(url, { method: 'PUT', headers, body: buffer as unknown as BodyInit })
     if (!res.ok) throw new Error(`S3 upload failed: ${res.status} ${res.statusText}`)
-    const publicUrl = this.config.s3PublicUrl || url
-    return { key: filename, url: publicUrl }
+    if (this.config.s3PublicUrl) {
+      return { key: filename, url: this.config.s3PublicUrl.replace(/\/$/, '') + '/' + filename }
+    }
+    return { key: filename, url }
   }
 
   async delete(key: string) {
@@ -215,8 +198,8 @@ class S3Storage implements StorageBackend {
     const cutoff = Date.now() - days * 86400000
     try {
       const listUrl = this.config.s3PathStyle
-        ? `${this.config.s3Endpoint}/${this.config.s3Bucket}?list-type=2`
-        : `${this.config.s3Endpoint.replace('://', `://${this.config.s3Bucket}.`)}?list-type=2`
+        ? `${this.config.s3Endpoint!.replace(/\/$/, '')}/${this.config.s3Bucket}?list-type=2`
+        : `${this.config.s3Endpoint!.replace('://', `://${this.config.s3Bucket}.`).replace(/\/$/, '')}/?list-type=2`
 
       const headers = await this.signRequestV4('GET', '', undefined, { 'list-type': '2' })
       const res = await fetch(listUrl, { method: 'GET', headers })
@@ -232,14 +215,16 @@ class S3Storage implements StorageBackend {
       for (let i = 0; i < keys.length; i++) {
         if (dates[i] < cutoff) await this.delete(keys[i])
       }
-    } catch { }
+    } catch (e) {
+      this.ctx.logger.warn(`[monitorluna] S3 清理失败: ${e instanceof Error ? e.message : String(e)}`)
+    }
   }
 
   private getUrl(key: string) {
     const { s3Endpoint, s3Bucket, s3PathStyle } = this.config
     if (!s3Endpoint) throw new Error('s3Endpoint is required')
-    if (s3PathStyle) return `${s3Endpoint}/${s3Bucket}/${key}`
-    return `${s3Endpoint.replace('://', `://${s3Bucket}.`)}/${key}`
+    if (s3PathStyle) return `${s3Endpoint.replace(/\/$/, '')}/${s3Bucket}/${key}`
+    return `${s3Endpoint.replace('://', `://${s3Bucket}.`).replace(/\/$/, '')}/${key}`
   }
 
   private async signRequestV4(method: string, key: string, body?: Buffer, queryParams?: Record<string, string>) {
@@ -249,13 +234,14 @@ class S3Storage implements StorageBackend {
     const region = this.config.s3Region || 'us-east-1'
     const service = 's3'
 
+    const endpointUrl = new URL(this.config.s3Endpoint!)
     const host = this.config.s3PathStyle
-      ? new URL(this.config.s3Endpoint).host
-      : `${this.config.s3Bucket}.${new URL(this.config.s3Endpoint).host}`
+      ? endpointUrl.host
+      : `${this.config.s3Bucket}.${endpointUrl.host}`
 
     const canonicalUri = this.config.s3PathStyle ? `/${this.config.s3Bucket}/${key}` : `/${key}`
     const canonicalQuerystring = queryParams
-      ? Object.entries(queryParams).sort().map(([k, v]) => `${k}=${v}`).join('&')
+      ? Object.entries(queryParams).sort().map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&')
       : ''
 
     const payloadHash = crypto.createHash('sha256').update(body || '').digest('hex')
@@ -305,12 +291,11 @@ export interface Config {
   s3PublicUrl?: string
   s3PathStyle?: boolean
   imageRetentionDays: number
+  pushChannelIds: string[]
+  pushPrivateIds: string[]
+  pushPollInterval: number
   dailySummaryEnabled: boolean
   dailySummaryTime: string
-  dailySummaryTargets: Array<{
-    deviceId: string
-    channelIds: string[]
-  }>
 }
 
 export const Config: Schema<Config> = Schema.intersect([
@@ -346,13 +331,14 @@ export const Config: Schema<Config> = Schema.intersect([
   ]),
   Schema.object({
     imageRetentionDays: Schema.number().default(7).description('图片保存天数'),
-    dailySummaryEnabled: Schema.boolean().default(false).description('启用每日总结'),
-    dailySummaryTime: Schema.string().default('22:00').description('每日总结时间（HH:mm）'),
-    dailySummaryTargets: Schema.array(Schema.object({
-      deviceId: Schema.string().required().description('设备 ID'),
-      channelIds: Schema.array(String).description('推送目标群组'),
-    })).default([]).description('每日总结推送配置'),
   }),
+  Schema.object({
+    pushChannelIds: Schema.array(Schema.string()).default([]).description('推送目标群组（格式: platform:selfId:channelId）'),
+    pushPrivateIds: Schema.array(Schema.string()).default([]).description('推送目标私聊（格式: platform:selfId:userId）'),
+    pushPollInterval: Schema.number().default(10000).description('应用切换轮询间隔（毫秒）'),
+    dailySummaryEnabled: Schema.boolean().default(false).description('启用每日总结推送'),
+    dailySummaryTime: Schema.string().default('22:00').description('每日总结推送时间（HH:mm）'),
+  }).description('推送设置'),
 ])
 
 // ── Interfaces ──
@@ -376,51 +362,60 @@ export function apply(ctx: Context, config: Config) {
   let storage: StorageBackend
 
   // Initialize database
-  ctx.model.extend('monitorluna_activity', {
-    id: 'unsigned',
-    deviceId: 'string',
-    process: 'string',
-    title: 'text',
-    timestamp: 'timestamp'
-  }, { autoInc: true })
-
   ctx.model.extend('monitorluna_screenshot', {
     id: 'unsigned',
     deviceId: 'string',
     url: 'string',
-    timestamp: 'timestamp'
-  }, { autoInc: true })
-
-  ctx.model.extend('monitorluna_icon', {
-    hash: 'string',
-    data: 'text'
-  }, { primary: 'hash' })
-
-  ctx.model.extend('monitorluna_input_stats', {
-    id: 'unsigned',
-    deviceId: 'string',
-    process: 'string',
-    displayName: 'string',
-    iconHash: 'string',
-    keyPresses: 'unsigned',
-    leftClicks: 'unsigned',
-    rightClicks: 'unsigned',
-    scrollDistance: 'double',
+    type: 'string',
     timestamp: 'timestamp'
   }, { autoInc: true })
 
   // Initialize storage
   if (config.storageType === 'local') storage = new LocalStorage(ctx, config)
-  else if (config.storageType === 'webdav') storage = new WebDAVStorage(config)
-  else storage = new S3Storage(config)
+  else if (config.storageType === 'webdav') storage = new WebDAVStorage(config, ctx)
+  else storage = new S3Storage(config, ctx)
 
   const timers: ReturnType<typeof setInterval>[] = []
 
+  function clearPendingCommands(device: DeviceConnection, error: Error) {
+    for (const pending of device.pendingCommands.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(error)
+    }
+    device.pendingCommands.clear()
+  }
+
+  async function saveScreenshotRecord(deviceId: string, url: string, type: Screenshot['type']) {
+    await ctx.database.create('monitorluna_screenshot', {
+      deviceId,
+      url,
+      type,
+      timestamp: new Date()
+    })
+  }
+
+  async function renderSummaryImage(puppeteer: any, html: string): Promise<Buffer> {
+    const page = await puppeteer.page()
+    try {
+      await page.setContent(html)
+      const body = await page.$('body')
+      const clip = body ? await body.boundingBox() : null
+      return await page.screenshot({ clip, type: 'jpeg', quality: 90 })
+    } finally {
+      await page.close().catch(() => { })
+    }
+  }
+
   ctx.on('ready', async () => {
     await storage.init()
-    timers.push(startCleanupTimer())
-    timers.push(startPeriodicScreenshot())
-    if (config.dailySummaryEnabled) timers.push(startDailySummary())
+    // Immediate cleanup on start
+    storage.cleanup(config.imageRetentionDays).catch(() => { })
+    timers.push(setInterval(() => {
+      storage.cleanup(config.imageRetentionDays).catch(() => { })
+    }, 86400000))
+
+    startPushPolling()
+    if (config.dailySummaryEnabled) startDailySummary()
   })
 
   ctx.on('dispose', () => {
@@ -429,7 +424,7 @@ export function apply(ctx: Context, config: Config) {
   })
 
   // WebSocket handler
-  ctx.server.ws('/monitorluna', (ws: WebSocket, req: IncomingMessage) => {
+  ctx.server.ws('/monitorluna', (ws: WebSocket, _req: IncomingMessage) => {
     let deviceId: string | null = null
     let device: DeviceConnection | null = null
 
@@ -449,28 +444,15 @@ export function apply(ctx: Context, config: Config) {
           return
         }
         deviceId = String(msg.device_id || 'unknown')
+        const existing = devices.get(deviceId)
+        if (existing && existing.ws !== ws) {
+          clearPendingCommands(existing, new Error('设备连接已被新的会话替换'))
+          existing.ws.close(1000, 'replaced by new session')
+        }
         device = { ws, deviceId, pendingCommands: new Map() }
         devices.set(deviceId, device)
         ctx.logger.info(`[monitorluna] 设备上线: ${deviceId}`)
         ws.send(JSON.stringify({ type: 'hello_ack', message: 'connected' }))
-        return
-      }
-
-      if (msg.type === 'activity') {
-        if (!deviceId) {
-          ws.close(1008, 'not authenticated')
-          return
-        }
-        handleActivity(deviceId, msg).catch(e => ctx.logger.warn(`[monitorluna] 处理活动失败: ${e.message}`))
-        return
-      }
-
-      if (msg.type === 'input_stats') {
-        if (!deviceId) {
-          ws.close(1008, 'not authenticated')
-          return
-        }
-        handleInputStats(deviceId, msg).catch(e => ctx.logger.warn(`[monitorluna] 处理输入统计失败: ${e.message}`))
         return
       }
 
@@ -491,16 +473,16 @@ export function apply(ctx: Context, config: Config) {
     })
 
     ws.on('close', () => {
-      if (deviceId) {
-        devices.delete(deviceId)
-        ctx.logger.info(`[monitorluna] 设备下线: ${deviceId}`)
-        if (device) {
-          for (const pending of device.pendingCommands.values()) {
-            clearTimeout(pending.timer)
-            pending.reject(new Error('设备断开连接'))
-          }
-          device.pendingCommands.clear()
+      if (deviceId && device) {
+        const isCurrentConnection = devices.get(deviceId)?.ws === ws
+        if (isCurrentConnection) {
+          devices.delete(deviceId)
+          lastKnownApp.delete(deviceId)
+          ctx.logger.info(`[monitorluna] 设备下线: ${deviceId}`)
+        } else {
+          ctx.logger.info(`[monitorluna] 设备旧连接关闭: ${deviceId}`)
         }
+        clearPendingCommands(device, new Error('设备断开连接'))
       }
     })
 
@@ -519,236 +501,191 @@ export function apply(ctx: Context, config: Config) {
         reject(new Error('指令超时'))
       }, config.commandTimeout)
       device.pendingCommands.set(id, { resolve, reject, timer })
-      device.ws.send(JSON.stringify({ type: 'command', id, cmd }))
+      try {
+        device.ws.send(JSON.stringify({ type: 'command', id, cmd }))
+      } catch (error) {
+        clearTimeout(timer)
+        device.pendingCommands.delete(id)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
     })
   }
 
-  async function handleActivity(deviceId: string, msg: any) {
-    const process = msg.process
-    const title = msg.title
-    if (config.debug) ctx.logger.info(`[monitorluna][debug] activity: device=${deviceId}, process=${process}, title=${title}`)
-    try {
-      await ctx.database.create('monitorluna_activity', {
-        deviceId,
-        process,
-        title,
-        timestamp: new Date()
-      })
-    } catch (e) {
-      ctx.logger.warn(`[monitorluna] 记录活动失败: ${e instanceof Error ? e.message : String(e)}`)
-    }
-  }
+  // ── Push Polling ──
+  const lastKnownApp = new Map<string, { title: string; process: string }>()
 
-  async function handleInputStats(deviceId: string, msg: any) {
-    const stats = msg.stats
-    if (!stats) return
-    if (config.debug) ctx.logger.info(`[monitorluna][debug] input_stats: device=${deviceId}, apps=${Object.keys(stats).length}`)
-    try {
-      const now = new Date()
-      const iconUpdates: IconData[] = []
-      const rows = (Object.entries(stats) as [string, any][]).map(([process, data]) => {
-        let iconHash = ''
-        if (data.icon_base64) {
-          iconHash = crypto.createHash('md5').update(data.icon_base64).digest('hex')
-          iconUpdates.push({ hash: iconHash, data: data.icon_base64 })
-        }
-        return {
-          deviceId,
-          process,
-          displayName: data.display_name || process,
-          iconHash,
-          keyPresses: data.key_presses || 0,
-          leftClicks: data.left_clicks || 0,
-          rightClicks: data.right_clicks || 0,
-          scrollDistance: data.scroll_distance || 0,
-          timestamp: now
-        }
-      })
-
-      if (iconUpdates.length > 0) {
-        await ctx.database.upsert('monitorluna_icon', iconUpdates)
-      }
-      await ctx.database.create('monitorluna_input_stats', rows)
-    } catch (e) {
-      ctx.logger.warn(`[monitorluna] 记录输入统计失败: ${e instanceof Error ? e.message : String(e)}`)
-    }
-  }
-
-  function startPeriodicScreenshot() {
-    return setInterval(async () => {
-      for (const [deviceId] of devices) {
-        try {
-          const data = await sendCommand(deviceId, 'screenshot')
-          const buf = Buffer.from(data, 'base64')
-          const filename = `${deviceId}_${Date.now()}.jpg`
-          const { url } = await storage.upload(buf, filename)
-          await ctx.database.create('monitorluna_screenshot', {
-            deviceId,
-            url,
-            timestamp: new Date()
-          })
-          if (config.debug) ctx.logger.info(`[monitorluna][debug] periodic screenshot ok: ${deviceId}, url: ${url}`)
-        } catch (e) {
-          // Device offline, skip
-        }
-      }
-    }, 15 * 60 * 1000) // 每 15 分钟
-  }
-
-  function startCleanupTimer() {
-    return setInterval(() => {
-      storage.cleanup(config.imageRetentionDays).catch(e =>
-        ctx.logger.warn(`[monitorluna] 清理失败: ${e.message}`)
-      )
-    }, 86400000) // Daily
-  }
-
-  function startDailySummary() {
-    const [hour, minute] = config.dailySummaryTime.split(':').map(Number)
-    return setInterval(() => {
-      const now = new Date()
-      if (now.getHours() === hour && now.getMinutes() === minute) {
-        generateDailySummary()
-      }
-    }, 60000)
-  }
-
-  async function generateDailySummary() {
-    const today = new Date()
-    today.setHours(0, 0, 0, 0)
-    const tomorrow = new Date(today)
-    tomorrow.setDate(tomorrow.getDate() + 1)
-
-    for (const target of config.dailySummaryTargets) {
-      const records = await ctx.database.get('monitorluna_activity', {
-        deviceId: target.deviceId,
-        timestamp: { $gte: today, $lt: tomorrow }
-      })
-      if (records.length === 0) continue
-
-      const html = await buildSummaryHtml(records, target.deviceId, today, tomorrow)
-      const puppeteer = (ctx as any)['puppeteer']
-      if (!puppeteer) {
-        ctx.logger.warn('[monitorluna] puppeteer 服务未启用，跳过每日总结')
+  async function sendToTargets(content: string) {
+    const targets = [...config.pushChannelIds.map(t => ({ t, type: 'channel' })), ...config.pushPrivateIds.map(t => ({ t, type: 'private' }))]
+    for (const { t, type } of targets) {
+      const [platform, selfId, id] = t.split(':')
+      if (!platform || !selfId || !id) continue
+      const bot = ctx.bots[`${platform}:${selfId}`]
+      if (!bot) {
+        ctx.logger.warn(`[monitorluna] 找不到机器人 ${platform}:${selfId}`)
         continue
       }
-      const page = await puppeteer.page()
-      await page.setContent(html)
-      const body = await page.$('body')
-      const clip = body ? await body.boundingBox() : null
-      const buf = await page.screenshot({ clip, type: 'jpeg', quality: 90 })
-      await page.close()
-      const filename = `summary_${target.deviceId}_${Date.now()}.jpg`
-      const { url } = await storage.upload(buf, filename)
-
-      for (const channelId of target.channelIds) {
-        const parts = channelId.split(':')
-        const [platform, selfId] = parts
-        const gid = parts.slice(2).join(':')
-        await ctx.bots[`${platform}:${selfId}`]?.sendMessage(gid, h.image(url))
+      try {
+        if (type === 'channel') await bot.sendMessage(id, content)
+        else await bot.sendPrivateMessage(id, content)
+      } catch (e) {
+        ctx.logger.warn(`[monitorluna] 发送失败到 ${t}: ${e instanceof Error ? e.message : String(e)}`)
       }
     }
   }
 
-  async function buildSummaryHtml(records: ActivityLog[], deviceId: string, today: Date, tomorrow: Date): Promise<string> {
-    const date = new Date().toLocaleDateString('zh-CN')
+  function startPushPolling() {
+    if (config.pushChannelIds.length === 0 && config.pushPrivateIds.length === 0) return
 
-    // 格式化应用名称（去除 .exe）
+    const poll = async () => {
+      for (const [deviceId] of devices) {
+        try {
+          const data = await sendCommand(deviceId, 'window_info')
+          const info = JSON.parse(data)
+          const prev = lastKnownApp.get(deviceId)
+          const current = { title: info.title || '', process: info.process || '' }
+
+          if (prev && (prev.process !== current.process || prev.title !== current.title)) {
+            try {
+              const screenshotData = await sendCommand(deviceId, 'window_screenshot')
+              const buf = Buffer.from(screenshotData, 'base64')
+              const filename = `push_${deviceId}_${Date.now()}.jpg`
+              const { url } = await storage.upload(buf, filename)
+              const processName = current.process.replace(/\.exe$/i, '')
+
+              await saveScreenshotRecord(deviceId, url, 'push')
+
+              await sendToTargets(`🖥️ ${deviceId} 切换到: ${processName}\n${current.title}\n${h.image(url)}`)
+            } catch (e) {
+              ctx.logger.debug(`[monitorluna] 推送截图失败: ${e instanceof Error ? e.message : String(e)}`)
+            }
+          }
+          lastKnownApp.set(deviceId, current)
+        } catch { }
+      }
+    }
+    void poll()
+    timers.push(setInterval(() => { void poll() }, config.pushPollInterval))
+  }
+
+  // ── Daily Summary ──
+  function startDailySummary() {
+    const check = async () => {
+      const now = new Date()
+      const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+
+      if (currentTime === config.dailySummaryTime) {
+        const puppeteer = (ctx as any)['puppeteer']
+        if (puppeteer) {
+          const todayStart = new Date()
+          todayStart.setHours(0, 0, 0, 0)
+          const todayEnd = new Date()
+          todayEnd.setHours(23, 59, 59, 999)
+
+          for (const [deviceId] of devices) {
+            try {
+              // Persistence check via database
+              const existing = await ctx.database.get('monitorluna_screenshot', {
+                deviceId,
+                type: 'daily',
+                timestamp: { $gte: todayStart, $lte: todayEnd }
+              })
+
+              if (existing.length > 0) continue
+
+              const dataStr = await sendCommand(deviceId, 'query_daily_data')
+              const data = JSON.parse(dataStr)
+              if (!data.activities || data.activities.length === 0) continue
+
+              const html = await buildSummaryHtml(data, deviceId)
+              const buf = await renderSummaryImage(puppeteer, html)
+
+              const filename = `daily_${deviceId}_${Date.now()}.jpg`
+              const { url } = await storage.upload(buf, filename)
+
+              await saveScreenshotRecord(deviceId, url, 'daily')
+
+              await sendToTargets(`📊 ${deviceId} 每日活动总结\n${h.image(url)}`)
+            } catch (e) {
+              ctx.logger.warn(`[monitorluna] 每日总结推送失败 (${deviceId}): ${e instanceof Error ? e.message : String(e)}`)
+            }
+          }
+        }
+      }
+    }
+    void check()
+    timers.push(setInterval(() => { void check() }, 60000))
+  }
+
+  async function buildSummaryHtml(data: any, deviceId: string): Promise<string> {
+    const date = new Date().toLocaleDateString('zh-CN')
     const formatAppName = (process: string) => process.replace(/\.exe$/i, '')
 
-    // 查询输入统计数据（今天0点到现在）
-    const inputStats = await ctx.database.get('monitorluna_input_stats', {
-      deviceId,
-      timestamp: { $gte: today, $lt: tomorrow }
-    })
+    const records = data.activities || []
+    const inputStatsData = data.input_stats || {}
+    const browserActivityData = data.browser_activity || {}
+    const iconsData = data.icons || {}
+
+    // 处理浏览器活动
+    const topBrowserDomains: [string, number][] = (Object.entries(browserActivityData) as [string, number][])
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
 
     // 构建图标映射
-    const iconHashes = [...new Set(inputStats.map(s => s.iconHash).filter(Boolean))]
-    const icons = iconHashes.length > 0 ? await ctx.database.get('monitorluna_icon', { hash: iconHashes }) : []
-    const iconHashDataMap = new Map(icons.map(i => [i.hash, i.data]))
-
     const iconMap = new Map<string, string>()
-    for (const record of inputStats) {
-      if (record.iconHash && !iconMap.has(record.process)) {
-        const data = iconHashDataMap.get(record.iconHash)
-        if (data) iconMap.set(record.process, data)
+    for (const [process, stats] of Object.entries(inputStatsData) as [string, any][]) {
+      if (stats.icon_hash && iconsData[stats.icon_hash]) {
+        iconMap.set(process, iconsData[stats.icon_hash])
       }
     }
 
-    // 聚合输入统计
-    const appInputStats = new Map<string, { displayName: string, iconHash: string, keyPresses: number, clicks: number, scrollDistance: number }>()
-    for (const record of inputStats) {
-      const existing = appInputStats.get(record.process) || {
-        displayName: record.displayName,
-        iconHash: record.iconHash,
-        keyPresses: 0,
-        clicks: 0,
-        scrollDistance: 0
-      }
-      existing.keyPresses += record.keyPresses
-      existing.clicks += record.leftClicks + record.rightClicks
-      existing.scrollDistance += record.scrollDistance
-      appInputStats.set(record.process, existing)
-    }
-
-    // TOP 6（按总输入量排序）
-    const topInputApps = [...appInputStats.entries()]
+    // 处理输入统计
+    interface InputAppStats { displayName: string, iconHash: string, keyPresses: number, clicks: number, scrollDistance: number }
+    const topInputApps: [string, InputAppStats][] = (Object.entries(inputStatsData) as [string, any][])
+      .map(([process, stats]) => [process, {
+        displayName: stats.display_name,
+        iconHash: stats.icon_hash,
+        keyPresses: stats.key_presses || 0,
+        clicks: (stats.left_clicks || 0) + (stats.right_clicks || 0),
+        scrollDistance: stats.scroll_distance || 0
+      }] as [string, InputAppStats])
       .sort((a, b) => (b[1].keyPresses + b[1].clicks) - (a[1].keyPresses + a[1].clicks))
       .slice(0, 6)
 
-    // 计算最大值用于进度条
-    const maxKeys = Math.max(...topInputApps.map(([, s]) => s.keyPresses), 1)
-    const maxClicks = Math.max(...topInputApps.map(([, s]) => s.clicks), 1)
-    const maxScroll = Math.max(...topInputApps.map(([, s]) => s.scrollDistance), 1)
+    const maxKeys = Math.max(...topInputApps.map((a: any) => a[1].keyPresses), 1)
+    const maxClicks = Math.max(...topInputApps.map((a: any) => a[1].clicks), 1)
+    const maxScroll = Math.max(...topInputApps.map((a: any) => a[1].scrollDistance), 1)
 
-    // 按时间排序
-    records.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+    // 处理活动记录
+    records.sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
 
-    // 按小时统计每个进程的活跃时长（分钟）
-    const hourlyStats = new Map<number, Map<string, number>>() // hour -> process -> minutes
+    const hourlyStats = new Map<number, Map<string, number>>()
     for (let h = 0; h < 24; h++) hourlyStats.set(h, new Map())
 
     for (let i = 0; i < records.length - 1; i++) {
       const curr = records[i]
       const next = records[i + 1]
-      const duration = (next.timestamp.getTime() - curr.timestamp.getTime()) / 1000 / 60 // 分钟
-      const hour = curr.timestamp.getHours()
-
+      const duration = (new Date(next.timestamp).getTime() - new Date(curr.timestamp).getTime()) / 1000 / 60
+      const hour = new Date(curr.timestamp).getHours()
       const processMap = hourlyStats.get(hour)!
       processMap.set(curr.process, (processMap.get(curr.process) || 0) + duration)
     }
 
-    // 计算每小时的总活跃次数（用于柱状图）
     const hourlyActivity = new Map<number, number>()
     for (let h = 0; h < 24; h++) hourlyActivity.set(h, 0)
-    records.forEach(r => {
-      const hour = r.timestamp.getHours()
+    records.forEach((r: any) => {
+      const hour = new Date(r.timestamp).getHours()
       hourlyActivity.set(hour, (hourlyActivity.get(hour) || 0) + 1)
     })
 
-    // 每小时活跃时间最长的 4 个进程
     const hourlyTop4 = new Map<number, Array<[string, number]>>()
     for (const [hour, processMap] of hourlyStats.entries()) {
-      const top4 = [...processMap.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 4)
+      const top4 = [...processMap.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4)
       hourlyTop4.set(hour, top4)
     }
 
-    // 全天活跃时间最长的 4 个进程
-    const totalDuration = new Map<string, number>()
-    for (const processMap of hourlyStats.values()) {
-      for (const [process, duration] of processMap) {
-        totalDuration.set(process, (totalDuration.get(process) || 0) + duration)
-      }
-    }
-    const topDuration = [...totalDuration.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 4)
-
     const maxActivity = Math.max(...hourlyActivity.values(), 1)
-    const startHour = records.length > 0 ? Math.min(...records.map(r => r.timestamp.getHours())) : 0
-    const endHour = records.length > 0 ? Math.max(...records.map(r => r.timestamp.getHours())) : 23
+    const startHour = records.length > 0 ? Math.min(...records.map((r: any) => new Date(r.timestamp).getHours())) : 0
+    const endHour = records.length > 0 ? Math.max(...records.map((r: any) => new Date(r.timestamp).getHours())) : 23
 
     return `<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -856,6 +793,16 @@ ${topInputApps.map(([process, stats], idx) => {
     }).join('')}` : '<div style="color:var(--ink-secondary);text-align:center;padding:20px">暂无输入统计数据</div>'}
 </div>
 </div>
+${topBrowserDomains.length > 0 ? `<div class="section">
+<div class="section-title">🌐 浏览器活动 TOP 8</div>
+<div class="list-box">
+${topBrowserDomains.map(([domain, seconds], idx) => {
+      const minutes = Math.round(seconds / 60)
+      const display = minutes >= 60 ? `${Math.floor(minutes / 60)}h${minutes % 60}m` : minutes > 0 ? `${minutes}m` : `${Math.round(seconds)}s`
+      return `<div class="list-item"><span class="item-name">${idx + 1}. ${domain}</span><span class="item-value">${display}</span></div>`
+    }).join('')}
+</div>
+</div>` : ''}
 <div class="section">
 <div class="section-title">🕐 每小时 TOP 4</div>
 <div class="chart-box">
@@ -890,7 +837,10 @@ ${top.map(([app, dur]) => {
       try {
         const data = await sendCommand(device, 'screenshot')
         const buf = Buffer.from(data, 'base64')
-        return h.image(buf, 'image/jpeg')
+        const filename = `manual_${device}_${Date.now()}.jpg`
+        const { url } = await storage.upload(buf, filename)
+        await saveScreenshotRecord(device, url, 'manual')
+        return h.image(url)
       } catch (e) {
         return `截图失败: ${e instanceof Error ? e.message : String(e)}`
       }
@@ -902,7 +852,10 @@ ${top.map(([app, dur]) => {
       try {
         const data = await sendCommand(device, 'window_screenshot')
         const buf = Buffer.from(data, 'base64')
-        return h.image(buf, 'image/jpeg')
+        const filename = `window_${device}_${Date.now()}.jpg`
+        const { url } = await storage.upload(buf, filename)
+        await saveScreenshotRecord(device, url, 'manual')
+        return h.image(url)
       } catch (e) {
         return `窗口截图失败: ${e instanceof Error ? e.message : String(e)}`
       }
@@ -935,37 +888,26 @@ ${top.map(([app, dur]) => {
   monitor.subcommand('.analytics <device:string>', '生成当天活动总结')
     .action(async ({ session }, device) => {
       if (!device) return '请指定设备名称'
-      const today = new Date()
-      today.setHours(0, 0, 0, 0)
-      const tomorrow = new Date(today)
-      tomorrow.setDate(tomorrow.getDate() + 1)
-
-      const records = await ctx.database.get('monitorluna_activity', {
-        deviceId: device,
-        timestamp: { $gte: today, $lt: tomorrow }
-      })
-      if (config.debug) ctx.logger.info(`[monitorluna][debug] analytics: device=${device}, records=${records.length}`)
-      if (records.length === 0) return '今日暂无活动记录'
-
-      const puppeteer = (ctx as any)['puppeteer']
-      if (config.debug) ctx.logger.info(`[monitorluna][debug] puppeteer service: ${puppeteer ? 'available' : 'not available'}`)
-      if (!puppeteer) return '需要安装 puppeteer 插件才能生成总结图'
 
       try {
-        const html = await buildSummaryHtml(records, device, today, tomorrow)
-        if (config.debug) ctx.logger.info(`[monitorluna][debug] html length: ${html.length}`)
+        const dataStr = await sendCommand(device, 'query_daily_data')
+        const data = JSON.parse(dataStr)
 
-        const page = await puppeteer.page()
-        await page.setContent(html)
-        const body = await page.$('body')
-        const clip = body ? await body.boundingBox() : null
-        const buf = await page.screenshot({ clip, type: 'jpeg', quality: 90 })
-        await page.close()
+        if (!data.activities || data.activities.length === 0) {
+          return '今日暂无活动记录'
+        }
 
-        if (config.debug) ctx.logger.info(`[monitorluna][debug] screenshot ok, buf size: ${buf.length}`)
-        const filename = `summary_${device}_${Date.now()}.jpg`
+        const puppeteer = (ctx as any)['puppeteer']
+        if (!puppeteer) return '需要安装 puppeteer 插件才能生成总结图'
+
+        const html = await buildSummaryHtml(data, device)
+        const buf = await renderSummaryImage(puppeteer, html)
+
+        const filename = `manual_summary_${device}_${Date.now()}.jpg`
         const { url } = await storage.upload(buf, filename)
-        if (config.debug) ctx.logger.info(`[monitorluna][debug] upload ok, url: ${url}`)
+
+        await saveScreenshotRecord(device, url, 'analytics')
+
         return h.image(url)
       } catch (e) {
         return `生成总结失败: ${e instanceof Error ? e.message : String(e)}`

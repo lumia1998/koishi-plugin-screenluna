@@ -1,15 +1,13 @@
 // ==UserScript==
 // @name         MonitorLuna Browser Tracker
 // @namespace    https://github.com/lumia1998/koishi-plugin-monitorluna
-// @version      1.0.0
-// @description  追踪浏览器各域名活跃时长，上报到 MonitorLuna
+// @version      2.0.0
+// @description  追踪浏览器各域名活跃时长，上报到本地 MonitorLuna Agent
 // @author       MonitorLuna
 // @match        *://*/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
-// @grant        GM_xmlhttpRequest
-// @connect      *
 // @run-at       document-start
 // ==/UserScript==
 
@@ -19,24 +17,21 @@
   // ── 配置 ──────────────────────────────────────────────────────────────────
   const CFG_URL      = 'ml_url';
   const CFG_TOKEN    = 'ml_token';
-  const CFG_DEVICE   = 'ml_device';
   const REPORT_INTERVAL = 30000; // 30秒上报一次
   const IDLE_TIMEOUT    = 60000; // 1分钟无交互视为非活跃
 
-  let wsUrl    = GM_getValue(CFG_URL,    '');
-  let token    = GM_getValue(CFG_TOKEN,  '');
-  let deviceId = GM_getValue(CFG_DEVICE, '');
+  let wsUrl = GM_getValue(CFG_URL, 'ws://127.0.0.1:6315/ws/browser');
+  let wsToken = GM_getValue(CFG_TOKEN, '');
 
   // ── 菜单命令（点击脚本管理器图标可配置）──────────────────────────────────
   GM_registerMenuCommand('⚙️ MonitorLuna 设置', openSettings);
   GM_registerMenuCommand('📊 查看统计状态', showStatus);
 
   function openSettings() {
-    const curUrl    = GM_getValue(CFG_URL,    'ws://127.0.0.1:5140/monitorluna');
-    const curToken  = GM_getValue(CFG_TOKEN,  '');
-    const curDevice = GM_getValue(CFG_DEVICE, '');
+    const curUrl = GM_getValue(CFG_URL, 'ws://127.0.0.1:6315/ws/browser');
+    const curToken = GM_getValue(CFG_TOKEN, '');
 
-    const newUrl = prompt('WebSocket 服务器地址：', curUrl);
+    const newUrl = prompt('本地 Agent WebSocket 地址：', curUrl);
     if (newUrl === null) return;
 
     const trimmedUrl = newUrl.trim();
@@ -44,33 +39,14 @@
       alert('地址必须以 ws:// 或 wss:// 开头');
       return;
     }
-    if (trimmedUrl.startsWith('ws://')) {
-      try {
-        const parsed = new URL(trimmedUrl);
-        const host = parsed.hostname;
-        if (host !== 'localhost' && host !== '127.0.0.1') {
-          alert('⚠️ 非本地地址建议使用 wss:// 加密连接，当前使用的是不安全的 ws:// 协议');
-        }
-      } catch {}
-    }
 
-    const newToken = prompt('Token（与 Koishi 配置一致）：', curToken);
+    const newToken = prompt('浏览器扩展密码（留空则不启用鉴权）：', curToken);
     if (newToken === null) return;
-    const newDevice = prompt('Device ID：', curDevice || location.hostname);
-    if (newDevice === null) return;
 
-    if (!/^[A-Za-z0-9_\u4e00-\u9fff-]{1,32}$/.test(newDevice.trim())) {
-      alert('设备ID仅允许字母、数字、下划线、中文和连字符，最长32位');
-      return;
-    }
-
-    GM_setValue(CFG_URL,    trimmedUrl);
-    GM_setValue(CFG_TOKEN,  newToken.trim());
-    GM_setValue(CFG_DEVICE, newDevice.trim());
-
-    wsUrl    = trimmedUrl;
-    token    = newToken.trim();
-    deviceId = newDevice.trim();
+    GM_setValue(CFG_URL, trimmedUrl);
+    GM_setValue(CFG_TOKEN, newToken.trim());
+    wsUrl = trimmedUrl;
+    wsToken = newToken.trim();
 
     alert('✅ 保存成功！正在重新连接...');
     reconnect();
@@ -83,11 +59,10 @@
       .slice(0, 5)
       .map(([d, s]) => `  ${d}: ${Math.round(s)}s`)
       .join('\n');
-    alert(`MonitorLuna 状态\n服务器: ${wsUrl}\n连接状态: ${state}\n设备ID: ${deviceId}\n\n待上报 TOP5:\n${domains || '  (暂无数据)'}`);
+    alert(`MonitorLuna 状态\n服务器: ${wsUrl}\n连接状态: ${state}\n\n待上报 TOP5:\n${domains || '  (暂无数据)'}`);
   }
 
   // ── 时长追踪 ─────────────────────────────────────────────────────────────
-  // 每个标签页维护自己的计时，coordinator 在主标签页用 localStorage 汇总
   let pendingStats = {};   // domain -> seconds (本标签页待上报)
   let trackStart   = null; // 当前开始追踪的时间
   let isActive     = true; // 当前标签页是否处于活跃状态
@@ -155,7 +130,7 @@
   let reconnectTimer = null;
 
   function connect() {
-    if (!wsUrl || !token || !deviceId) return;
+    if (!wsUrl) return;
     try {
       ws = new WebSocket(wsUrl);
     } catch {
@@ -164,7 +139,7 @@
     }
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'hello', token, device_id: deviceId }));
+      ws.send(JSON.stringify({ type: 'hello', token: wsToken }));
     };
 
     ws.onmessage = (e) => {
@@ -221,8 +196,6 @@
     try {
       ws.send(JSON.stringify({
         type: 'browser_activity',
-        device_id: deviceId,
-        token,
         stats,
       }));
       pendingStats = {};
@@ -232,8 +205,7 @@
   }, REPORT_INTERVAL);
 
   // ── 初始化 ──────────────────────────────────────────────────────────────
-  if (!wsUrl || !token || !deviceId) {
-    // 首次使用，提示配置
+  if (!wsUrl) {
     setTimeout(() => {
       if (confirm('MonitorLuna: 检测到尚未配置，是否现在设置？')) {
         openSettings();
