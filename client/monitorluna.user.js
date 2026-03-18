@@ -17,11 +17,13 @@
   // ── 配置 ──────────────────────────────────────────────────────────────────
   const CFG_URL      = 'ml_url';
   const CFG_TOKEN    = 'ml_token';
+  const CFG_SETUP_DONE = 'ml_setup_done';
   const REPORT_INTERVAL = 30000; // 30秒上报一次
   const IDLE_TIMEOUT    = 60000; // 1分钟无交互视为非活跃
 
   let wsUrl = GM_getValue(CFG_URL, 'ws://127.0.0.1:6315/ws/browser');
   let wsToken = GM_getValue(CFG_TOKEN, '');
+  let setupDone = GM_getValue(CFG_SETUP_DONE, false);
 
   // ── 菜单命令（点击脚本管理器图标可配置）──────────────────────────────────
   GM_registerMenuCommand('⚙️ MonitorLuna 设置', openSettings);
@@ -45,8 +47,10 @@
 
     GM_setValue(CFG_URL, trimmedUrl);
     GM_setValue(CFG_TOKEN, newToken.trim());
+    GM_setValue(CFG_SETUP_DONE, true);
     wsUrl = trimmedUrl;
     wsToken = newToken.trim();
+    setupDone = true;
 
     alert('✅ 保存成功！正在重新连接...');
     reconnect();
@@ -205,7 +209,7 @@
   }, REPORT_INTERVAL);
 
   // ── 初始化 ──────────────────────────────────────────────────────────────
-  if (!wsUrl) {
+  if (!setupDone) {
     setTimeout(() => {
       if (confirm('MonitorLuna: 检测到尚未配置，是否现在设置？')) {
         openSettings();

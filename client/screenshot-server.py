@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import webbrowser
+import contextlib
 from pathlib import Path
 import platform
 from datetime import datetime, timedelta
@@ -642,6 +643,7 @@ class MonitorLunaAgent:
         self._last_window = None
         self._stats_task = None
         self._screenshot_task = None
+        self._thread = None
         start_input_monitoring()  # 启动输入监听
 
     def reload_config(self):
@@ -710,7 +712,7 @@ class MonitorLunaAgent:
         return connected
 
     async def _window_monitor(self, ws, device_id: str):
-        while True:
+        while self.running:
             try:
                 info = await asyncio.get_event_loop().run_in_executor(None, get_window_info)
                 key = (info["process"], info["title"])
@@ -718,43 +720,53 @@ class MonitorLunaAgent:
                     self._last_window = key
                     # 只存储到本地数据库
                     await asyncio.get_event_loop().run_in_executor(None, save_activity_to_db, info["process"], info["title"])
+                if ws.closed:
+                    break
+            except asyncio.CancelledError:
+                break
             except Exception:
                 pass
             await asyncio.sleep(2)
 
     async def _input_stats_sender(self):
         """定期保存输入统计和浏览器活动到本地数据库"""
-        while True:
-            await asyncio.sleep(30)
-            try:
-                stats = await asyncio.get_event_loop().run_in_executor(None, get_input_stats_snapshot)
-            except Exception:
-                pass
-            try:
-                browser_stats = await asyncio.get_event_loop().run_in_executor(None, get_browser_stats_snapshot)
-            except Exception:
-                pass
+        try:
+            while self.running:
+                await asyncio.sleep(30)
+                try:
+                    await asyncio.get_event_loop().run_in_executor(None, get_input_stats_snapshot)
+                except Exception:
+                    pass
+                try:
+                    await asyncio.get_event_loop().run_in_executor(None, get_browser_stats_snapshot)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            pass
 
     async def _screenshot_task_loop(self):
         """本地定时截图任务"""
-        while self.running:
-            cfg = self.config
-            if not cfg.get("screenshot_enabled", False):
-                await asyncio.sleep(60)
-                continue
+        try:
+            while self.running:
+                cfg = self.config
+                if not cfg.get("screenshot_enabled", False):
+                    await asyncio.sleep(60)
+                    continue
 
-            interval = cfg.get("screenshot_interval", 15) * 60
-            try:
-                img = await asyncio.get_event_loop().run_in_executor(None, pyautogui.screenshot)
-                now = datetime.now()
-                date_dir = Path(__file__).parent / "cronscreen" / now.strftime("%Y-%m-%d")
-                date_dir.mkdir(parents=True, exist_ok=True)
-                filename = date_dir / f"screenshot_{now.strftime('%H%M')}.jpg"
-                await asyncio.get_event_loop().run_in_executor(None, lambda: img.save(filename, "JPEG", quality=85))
-            except Exception as e:
-                print(f"Screenshot failed: {e}")
+                interval = cfg.get("screenshot_interval", 15) * 60
+                try:
+                    img = await asyncio.get_event_loop().run_in_executor(None, pyautogui.screenshot)
+                    now = datetime.now()
+                    date_dir = Path(__file__).parent / "cronscreen" / now.strftime("%Y-%m-%d")
+                    date_dir.mkdir(parents=True, exist_ok=True)
+                    filename = date_dir / f"screenshot_{now.strftime('%H%M')}.jpg"
+                    await asyncio.get_event_loop().run_in_executor(None, lambda: img.save(filename, "JPEG", quality=85))
+                except Exception as e:
+                    print(f"Screenshot failed: {e}")
 
-            await asyncio.sleep(interval)
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
 
     async def run_forever(self):
         delay = 3
@@ -769,24 +781,54 @@ class MonitorLunaAgent:
             delay = min(delay * 2, 60)
 
     def start_in_thread(self):
+        if self._thread and self._thread.is_alive():
+            return
+
         def _thread():
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
             # 启动独立的后台任务
             self._stats_task = self._loop.create_task(self._input_stats_sender())
             self._screenshot_task = self._loop.create_task(self._screenshot_task_loop())
-            self._loop.run_until_complete(self.run_forever())
+            try:
+                self._loop.run_until_complete(self.run_forever())
+            except RuntimeError as e:
+                if "Event loop stopped before Future completed" not in str(e):
+                    raise
+            finally:
+                for task in (self._stats_task, self._screenshot_task):
+                    if task:
+                        task.cancel()
+                pending = [task for task in asyncio.all_tasks(self._loop) if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    with contextlib.suppress(Exception):
+                        self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                self._loop.close()
+                self._loop = None
+                self._ws = None
+                self._stats_task = None
+                self._screenshot_task = None
+
         t = threading.Thread(target=_thread, daemon=True)
+        self._thread = t
         t.start()
 
     def stop(self):
         self.running = False
+        loop = self._loop
+        if not loop:
+            return
+
+        if self._ws:
+            asyncio.run_coroutine_threadsafe(self._ws.close(), loop)
         if self._stats_task:
-            self._stats_task.cancel()
+            loop.call_soon_threadsafe(self._stats_task.cancel)
         if self._screenshot_task:
-            self._screenshot_task.cancel()
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+            loop.call_soon_threadsafe(self._screenshot_task.cancel)
+        if self._thread and self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=3)
 
 
 # ── WebUI ─────────────────────────────────────────────────────────────────────
@@ -898,13 +940,17 @@ async def handle_post_config(request):
     data = await request.json()
     allowed_keys = {"url", "token", "device_id", "screenshot_enabled", "screenshot_interval", "browser_token"}
     filtered = {k: v for k, v in data.items() if k in allowed_keys}
+    if not filtered.get("url", "").strip():
+        return web.json_response({"ok": False, "message": "url is required"}, status=400)
+    filtered["url"] = filtered.get("url", "").strip()
+    filtered["device_id"] = filtered.get("device_id", "").strip() or agent.config.get("device_id", "my-pc")
+    filtered["browser_token"] = filtered.get("browser_token", "").strip()
     if filtered.get("token") == "***":
         filtered["token"] = agent.config.get("token", "")
     if filtered.get("browser_token") == "***":
         filtered["browser_token"] = agent.config.get("browser_token", "")
     save_config({**agent.config, **filtered})
     agent.stop()
-    await asyncio.sleep(0.5)
     agent.config = {**agent.config, **filtered}
     agent.running = True
     agent.start_in_thread()
